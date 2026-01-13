@@ -457,7 +457,7 @@ elif tab_selection == "🎯 Marketing Mix Modeling":
             target_col = st.selectbox(
                 "Select target/KPI column",
                 potential_target_cols if potential_target_cols else df.columns[1:],
-                key='target_col'
+                key='target_col_selector'
             )
         
         with col2:
@@ -474,7 +474,7 @@ elif tab_selection == "🎯 Marketing Mix Modeling":
             "Select media spend columns",
             cost_cols if cost_cols else df.columns[1:],
             default=cost_cols if cost_cols else [],
-            key='media_cols'
+            key='media_cols_selector'
         )
         
         if not media_cols:
