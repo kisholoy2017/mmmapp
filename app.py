@@ -133,22 +133,19 @@ def prepare_data_for_modeling(df, date_col, media_cols, target_col):
     return weekly_data
 
 def add_seasonality_features(df, date_col):
-    """Add seasonality features: day of week and month"""
+    """Add seasonality features: month only (day of week not useful for weekly aggregation)"""
     df = df.copy()
     df[date_col] = pd.to_datetime(df[date_col])
-    
-    # Day of week (0=Monday, 6=Sunday)
-    df['day_of_week'] = df[date_col].dt.dayofweek
     
     # Month of year (1-12)
     df['month'] = df[date_col].dt.month
     
-    # Create dummy variables for day of week and month
-    day_dummies = pd.get_dummies(df['day_of_week'], prefix='dow', drop_first=True)
+    # Create dummy variables for month only
+    # (Day of week dummies don't help when data is aggregated to weekly level)
     month_dummies = pd.get_dummies(df['month'], prefix='month', drop_first=True)
     
     # Combine
-    df_with_seasonality = pd.concat([df, day_dummies, month_dummies], axis=1)
+    df_with_seasonality = pd.concat([df, month_dummies], axis=1)
     
     return df_with_seasonality
 
@@ -423,6 +420,91 @@ elif tab_selection == "🔍 Data Overview":
                 st.write(", ".join(numeric_cols))
         else:
             st.warning(f"⚠️ Need at least 2 numeric columns for correlation. Found: {len(numeric_cols)}")
+        
+        # Spend vs Revenue plots for each media channel
+        st.markdown("---")
+        st.markdown("### 💰 Spend vs Revenue Analysis by Channel")
+        st.info("These scatter plots show the relationship between media spend and revenue for each channel over the entire time period.")
+        
+        # Identify media spend columns and revenue column
+        spend_cols = [col for col in df.columns if 'cost' in col.lower() or 'spend' in col.lower()]
+        revenue_cols = [col for col in df.columns if 'revenue' in col.lower() or 'sales' in col.lower()]
+        
+        if spend_cols and revenue_cols:
+            revenue_col = revenue_cols[0]  # Use first revenue column found
+            
+            # Create grid of plots
+            num_channels = len(spend_cols)
+            if num_channels > 0:
+                cols_per_row = 2
+                num_rows = (num_channels + cols_per_row - 1) // cols_per_row
+                
+                fig, axes = plt.subplots(num_rows, cols_per_row, figsize=(14, 5*num_rows))
+                if num_rows == 1 and cols_per_row == 1:
+                    axes = np.array([[axes]])
+                elif num_rows == 1:
+                    axes = axes.reshape(1, -1)
+                elif cols_per_row == 1:
+                    axes = axes.reshape(-1, 1)
+                
+                for idx, spend_col in enumerate(spend_cols):
+                    row = idx // cols_per_row
+                    col = idx % cols_per_row
+                    ax = axes[row, col]
+                    
+                    # Create scatter plot
+                    x_data = df[spend_col].values
+                    y_data = df[revenue_col].values
+                    
+                    # Remove any NaN or infinite values
+                    mask = np.isfinite(x_data) & np.isfinite(y_data)
+                    x_clean = x_data[mask]
+                    y_clean = y_data[mask]
+                    
+                    if len(x_clean) > 0:
+                        ax.scatter(x_clean, y_clean, alpha=0.6, s=50, color='steelblue')
+                        
+                        # Add trend line if enough data points
+                        if len(x_clean) > 2:
+                            z = np.polyfit(x_clean, y_clean, 1)
+                            p = np.poly1d(z)
+                            x_line = np.linspace(x_clean.min(), x_clean.max(), 100)
+                            ax.plot(x_line, p(x_line), "r--", alpha=0.8, linewidth=2, label='Trend')
+                            ax.legend()
+                        
+                        # Calculate correlation
+                        if len(x_clean) > 1:
+                            corr = np.corrcoef(x_clean, y_clean)[0, 1]
+                            ax.text(0.05, 0.95, f'Corr: {corr:.2f}', 
+                                   transform=ax.transAxes, 
+                                   fontsize=10, 
+                                   verticalalignment='top',
+                                   bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
+                    
+                    channel_name = spend_col.replace('_Cost', '').replace('_cost', '').replace('_Spend', '').replace('_spend', '')
+                    ax.set_title(f'{channel_name}', fontsize=12, fontweight='bold')
+                    ax.set_xlabel('Spend', fontsize=10)
+                    ax.set_ylabel('Revenue', fontsize=10)
+                    ax.grid(True, alpha=0.3)
+                
+                # Hide empty subplots
+                for idx in range(num_channels, num_rows * cols_per_row):
+                    row = idx // cols_per_row
+                    col = idx % cols_per_row
+                    fig.delaxes(axes[row, col])
+                
+                plt.tight_layout()
+                st.pyplot(fig)
+                
+                st.markdown("""
+                **💡 What to look for:**
+                - **Positive correlation**: Higher spend → Higher revenue (good!)
+                - **Scattered points**: Inconsistent performance or other factors at play
+                - **Flat trend**: Channel may not be driving incremental revenue
+                - **Strong trend line**: Clear relationship between spend and outcomes
+                """)
+        else:
+            st.warning("⚠️ Could not find spend and revenue columns for analysis.")
 
 # TAB 3: Marketing Mix Modeling
 elif tab_selection == "🎯 Marketing Mix Modeling":
