@@ -313,11 +313,11 @@ elif tab_selection == "🔍 Data Overview":
         validation_col1, validation_col2 = st.columns(2)
         
         with validation_col1:
-            # Check for minimum 24 months
-            if date_range_months >= 24:
-                st.success(f"✅ Sufficient data: {date_range_months:.1f} months (≥24 months required)")
+            # Check for minimum 20 months
+            if date_range_months >= 20:
+                st.success(f"✅ Sufficient data: {date_range_months:.1f} months (≥20 months required)")
             else:
-                st.error(f"❌ Insufficient data: {date_range_months:.1f} months (<24 months)")
+                st.error(f"❌ Insufficient data: {date_range_months:.1f} months (<20 months)")
         
         with validation_col2:
             # Check for required columns
@@ -331,12 +331,18 @@ elif tab_selection == "🔍 Data Overview":
         st.markdown("---")
         st.markdown("### 📊 Combined Dataset")
         
-        # Styled dataframe
-        st.dataframe(
-            df.style.background_gradient(subset=[col for col in df.columns if col != date_col], cmap='Blues'),
-            use_container_width=True,
-            height=400
-        )
+        # Styled dataframe - only apply gradient to numeric columns
+        numeric_cols = df.select_dtypes(include=[np.number]).columns.tolist()
+        numeric_cols = [col for col in numeric_cols if col != date_col]
+        
+        if numeric_cols:
+            st.dataframe(
+                df.style.background_gradient(subset=numeric_cols, cmap='Blues'),
+                use_container_width=True,
+                height=400
+            )
+        else:
+            st.dataframe(df, use_container_width=True, height=400)
         
         # Download button
         csv = df.to_csv(index=False)
@@ -394,8 +400,8 @@ elif tab_selection == "🎯 Marketing Mix Modeling":
         # Check data sufficiency
         date_range_months = (df[date_col].max() - df[date_col].min()).days / 30
         
-        if date_range_months < 24:
-            st.error(f"❌ Insufficient data for modeling: {date_range_months:.1f} months available (24 months required)")
+        if date_range_months < 20:
+            st.error(f"❌ Insufficient data for modeling: {date_range_months:.1f} months available (20 months required)")
             st.stop()
         
         st.success(f"✅ Data validation passed: {date_range_months:.1f} months available")
