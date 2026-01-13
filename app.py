@@ -87,6 +87,19 @@ def hill_derivative(x, kappa, slope=1.0):
     ks = np.power(k, slope)
     return slope * np.power(x, slope - 1.0) * ks / (xs + ks)**2
 
+def clean_numeric_columns(df):
+    """Clean numeric columns by removing commas and converting to float"""
+    df_cleaned = df.copy()
+    for col in df_cleaned.columns:
+        if df_cleaned[col].dtype == 'object':
+            try:
+                # Try to convert after removing commas
+                df_cleaned[col] = df_cleaned[col].astype(str).str.replace(',', '').astype(float)
+            except (ValueError, AttributeError):
+                # If conversion fails, keep as is
+                pass
+    return df_cleaned
+
 def calculate_metrics(y_true, y_pred):
     """Calculate model performance metrics"""
     # R-squared
@@ -260,6 +273,9 @@ if tab_selection == "📤 Data Upload":
                     cost_cols = [col for col in combined.columns if 'cost' in col.lower() or 'spend' in col.lower()]
                     combined[cost_cols] = combined[cost_cols].fillna(0)
                     
+                    # Clean numeric columns (remove commas, convert to float)
+                    combined = clean_numeric_columns(combined)
+                    
                     st.session_state.combined_data = combined
                     st.session_state.data_uploaded = True
                     
@@ -376,14 +392,37 @@ elif tab_selection == "🔍 Data Overview":
         st.markdown("---")
         st.markdown("### 🔥 Correlation Heatmap")
         
+        # Get numeric columns excluding date
         numeric_cols = df.select_dtypes(include=[np.number]).columns.tolist()
+        
         if len(numeric_cols) > 1:
-            fig, ax = plt.subplots(figsize=(12, 8))
+            fig, ax = plt.subplots(figsize=(14, 10))
             correlation_matrix = df[numeric_cols].corr()
-            sns.heatmap(correlation_matrix, annot=True, fmt='.2f', cmap='coolwarm', center=0, ax=ax)
-            plt.title('Correlation Matrix of Media Channels and KPI', fontsize=16, fontweight='bold')
+            
+            # Create heatmap with better visibility
+            sns.heatmap(
+                correlation_matrix, 
+                annot=True, 
+                fmt='.2f', 
+                cmap='coolwarm', 
+                center=0, 
+                ax=ax,
+                square=True,
+                linewidths=0.5,
+                cbar_kws={"shrink": 0.8}
+            )
+            plt.title('Correlation Matrix: Media Channels & KPI', fontsize=16, fontweight='bold', pad=20)
+            plt.xticks(rotation=45, ha='right')
+            plt.yticks(rotation=0)
             plt.tight_layout()
             st.pyplot(fig)
+            
+            # Show which columns are included
+            with st.expander("ℹ️ Columns in Correlation Matrix"):
+                st.write(f"**{len(numeric_cols)} numeric columns:**")
+                st.write(", ".join(numeric_cols))
+        else:
+            st.warning(f"⚠️ Need at least 2 numeric columns for correlation. Found: {len(numeric_cols)}")
 
 # TAB 3: Marketing Mix Modeling
 elif tab_selection == "🎯 Marketing Mix Modeling":
@@ -470,16 +509,20 @@ elif tab_selection == "🎯 Marketing Mix Modeling":
         if st.button("🚀 Run Marketing Mix Model", type="primary", use_container_width=True):
             with st.spinner("Training Marketing Mix Model... This may take a few minutes."):
                 try:
+                    # Clean data first (remove commas, convert to numeric)
+                    st.info("Step 1/7: Cleaning and validating data...")
+                    df = clean_numeric_columns(df)
+                    
                     # Prepare data with weekly aggregation
-                    st.info("Step 1/6: Aggregating data to weekly level...")
+                    st.info("Step 2/7: Aggregating data to weekly level...")
                     weekly_df = prepare_data_for_modeling(df, date_col, media_cols, target_col)
                     
                     # Add seasonality
-                    st.info("Step 2/6: Adding seasonality features...")
+                    st.info("Step 3/7: Adding seasonality features...")
                     weekly_df = add_seasonality_features(weekly_df, 'date')
                     
                     # Engineer features
-                    st.info("Step 3/6: Engineering media features (adstock + saturation)...")
+                    st.info("Step 4/7: Engineering media features (adstock + saturation)...")
                     
                     meta = {}
                     feat_cols = []
@@ -520,7 +563,7 @@ elif tab_selection == "🎯 Marketing Mix Modeling":
                         }
                     
                     # Train/test split
-                    st.info("Step 4/6: Splitting data into train and test sets...")
+                    st.info("Step 5/7: Splitting data into train and test sets...")
                     split_idx = int(len(weekly_df) * train_test_split)
                     train_df = weekly_df.iloc[:split_idx].copy()
                     test_df = weekly_df.iloc[split_idx:].copy()
@@ -546,7 +589,7 @@ elif tab_selection == "🎯 Marketing Mix Modeling":
                     y_test = test_df[target_col].values.astype(float)
                     
                     # Train model
-                    st.info("Step 5/6: Training OLS regression model...")
+                    st.info("Step 6/7: Training OLS regression model...")
                     model = sm.OLS(y_train, X_train).fit()
                     
                     # Predictions
@@ -554,7 +597,7 @@ elif tab_selection == "🎯 Marketing Mix Modeling":
                     y_test_pred = model.predict(X_test)
                     
                     # Calculate metrics
-                    st.info("Step 6/6: Calculating performance metrics...")
+                    st.info("Step 7/7: Calculating performance metrics...")
                     train_r2, train_mape, train_wmape = calculate_metrics(y_train, y_train_pred)
                     test_r2, test_mape, test_wmape = calculate_metrics(y_test, y_test_pred)
                     
