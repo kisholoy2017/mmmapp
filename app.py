@@ -649,7 +649,7 @@ elif tab_selection == "🎯 Marketing Mix Modeling":
         control_cols = st.multiselect(
             "Select control variables",
             [col for col in df.columns if col not in media_cols and col != target_col and col != date_col],
-            key='control_cols'
+            key='control_cols_selector'
         )
         
         # Run model button
