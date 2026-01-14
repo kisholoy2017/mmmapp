@@ -133,19 +133,22 @@ def prepare_data_for_modeling(df, date_col, media_cols, target_col):
     return weekly_data
 
 def add_seasonality_features(df, date_col):
-    """Add seasonality features: month only (day of week not useful for weekly aggregation)"""
+    """Add seasonality features: day of week and month (for daily data)"""
     df = df.copy()
     df[date_col] = pd.to_datetime(df[date_col])
+    
+    # Day of week (0=Monday, 6=Sunday)
+    df['day_of_week'] = df[date_col].dt.dayofweek
     
     # Month of year (1-12)
     df['month'] = df[date_col].dt.month
     
-    # Create dummy variables for month only
-    # (Day of week dummies don't help when data is aggregated to weekly level)
+    # Create dummy variables for day of week and month
+    day_dummies = pd.get_dummies(df['day_of_week'], prefix='dow', drop_first=True)
     month_dummies = pd.get_dummies(df['month'], prefix='month', drop_first=True)
     
     # Combine
-    df_with_seasonality = pd.concat([df, month_dummies], axis=1)
+    df_with_seasonality = pd.concat([df, day_dummies, month_dummies], axis=1)
     
     return df_with_seasonality
 
@@ -655,19 +658,21 @@ elif tab_selection == "🎯 Marketing Mix Modeling":
             with st.spinner("Training Marketing Mix Model... This may take a few minutes."):
                 try:
                     # Clean data first (remove commas, convert to numeric)
-                    st.info("Step 1/7: Cleaning and validating data...")
+                    st.info("Step 1/6: Cleaning and validating data...")
                     df = clean_numeric_columns(df)
                     
-                    # Prepare data with weekly aggregation
-                    st.info("Step 2/7: Aggregating data to weekly level...")
-                    weekly_df = prepare_data_for_modeling(df, date_col, media_cols, target_col)
+                    # Prepare daily data (no aggregation)
+                    st.info("Step 2/6: Preparing daily data...")
+                    daily_df = df.copy()
+                    daily_df[date_col] = pd.to_datetime(daily_df[date_col])
+                    daily_df = daily_df.sort_values(date_col).reset_index(drop=True)
                     
-                    # Add seasonality
-                    st.info("Step 3/7: Adding seasonality features...")
-                    weekly_df = add_seasonality_features(weekly_df, 'date')
+                    # Add seasonality (day of week + month)
+                    st.info("Step 3/6: Adding seasonality features (day of week + month)...")
+                    daily_df = add_seasonality_features(daily_df, date_col)
                     
                     # Engineer features
-                    st.info("Step 4/7: Engineering media features (adstock + saturation)...")
+                    st.info("Step 4/6: Engineering media features (adstock + saturation)...")
                     
                     meta = {}
                     feat_cols = []
@@ -678,27 +683,27 @@ elif tab_selection == "🎯 Marketing Mix Modeling":
                         ch_slope = channel_params[media_col]['hill_slope']
                         
                         # Adstock with channel-specific rate
-                        weekly_df[f'{media_col}_adstock'] = adstock_transformation(
-                            weekly_df[media_col].values, alpha=ch_adstock
+                        daily_df[f'{media_col}_adstock'] = adstock_transformation(
+                            daily_df[media_col].values, alpha=ch_adstock
                         )
                         
                         # Hill saturation with channel-specific slope
-                        kappa = np.nanmedian(weekly_df[f'{media_col}_adstock'].values)
+                        kappa = np.nanmedian(daily_df[f'{media_col}_adstock'].values)
                         if not np.isfinite(kappa) or kappa <= 0:
-                            kappa = np.nanmean(weekly_df[f'{media_col}_adstock'].values) or 1.0
+                            kappa = np.nanmean(daily_df[f'{media_col}_adstock'].values) or 1.0
                         
-                        weekly_df[f'{media_col}_saturated'] = hill_transformation(
-                            weekly_df[f'{media_col}_adstock'].values,
+                        daily_df[f'{media_col}_saturated'] = hill_transformation(
+                            daily_df[f'{media_col}_adstock'].values,
                             kappa=kappa,
                             slope=ch_slope
                         )
                         
                         # Standardize
-                        mu = weekly_df[f'{media_col}_saturated'].mean()
-                        sd = weekly_df[f'{media_col}_saturated'].std() or 1.0
+                        mu = daily_df[f'{media_col}_saturated'].mean()
+                        sd = daily_df[f'{media_col}_saturated'].std() or 1.0
                         
                         feat_name = f'{media_col}_feat'
-                        weekly_df[feat_name] = (weekly_df[f'{media_col}_saturated'] - mu) / sd
+                        daily_df[feat_name] = (daily_df[f'{media_col}_saturated'] - mu) / sd
                         
                         feat_cols.append(feat_name)
                         
@@ -713,13 +718,13 @@ elif tab_selection == "🎯 Marketing Mix Modeling":
                         }
                     
                     # Train/test split
-                    st.info("Step 5/7: Splitting data into train and test sets...")
-                    split_idx = int(len(weekly_df) * train_test_split)
-                    train_df = weekly_df.iloc[:split_idx].copy()
-                    test_df = weekly_df.iloc[split_idx:].copy()
+                    st.info("Step 5/6: Splitting data into train and test sets...")
+                    split_idx = int(len(daily_df) * train_test_split)
+                    train_df = daily_df.iloc[:split_idx].copy()
+                    test_df = daily_df.iloc[split_idx:].copy()
                     
                     # Prepare X and y
-                    seasonality_cols = [col for col in weekly_df.columns if 'dow_' in col or 'month_' in col]
+                    seasonality_cols = [col for col in daily_df.columns if 'dow_' in col or 'month_' in col]
                     
                     X_train = pd.concat([
                         pd.Series(1.0, index=train_df.index, name='const'),
@@ -739,7 +744,7 @@ elif tab_selection == "🎯 Marketing Mix Modeling":
                     y_test = test_df[target_col].values.astype(float)
                     
                     # Train model
-                    st.info("Step 6/7: Training OLS regression model...")
+                    st.info("Step 6/6: Training OLS regression model...")
                     model = sm.OLS(y_train, X_train).fit()
                     
                     # Predictions
@@ -747,7 +752,6 @@ elif tab_selection == "🎯 Marketing Mix Modeling":
                     y_test_pred = model.predict(X_test)
                     
                     # Calculate metrics
-                    st.info("Step 7/7: Calculating performance metrics...")
                     train_r2, train_mape, train_wmape = calculate_metrics(y_train, y_train_pred)
                     test_r2, test_mape, test_wmape = calculate_metrics(y_test, y_test_pred)
                     
@@ -849,6 +853,7 @@ elif tab_selection == "📈 Results & Insights":
             "💰 ROI Analysis",
             "📈 Response Curves",
             "🎯 Budget Allocation",
+            "🔮 Monthly Forecast",
             "📋 Model Summary"
         ])
         
@@ -1248,8 +1253,226 @@ elif tab_selection == "📈 Results & Insights":
                 lift_pct = (expected_lift / current_revenue) * 100
                 st.metric("Expected Lift", f"{lift_pct:+.1f}%")
         
-        # Tab 5: Model Summary
+        # Tab 5: Monthly Forecast
         with result_tabs[4]:
+            st.markdown("### 🔮 Monthly Revenue Forecast")
+            
+            st.info("""
+            This forecast projects monthly revenue based on:
+            - Current media spend levels (average from test period)
+            - Seasonal patterns (day of week + month effects from the model)
+            - Baseline revenue
+            """)
+            
+            # User inputs for forecast
+            forecast_col1, forecast_col2 = st.columns(2)
+            
+            with forecast_col1:
+                forecast_months = st.slider(
+                    "Forecast Horizon (Months)",
+                    min_value=1,
+                    max_value=12,
+                    value=3,
+                    help="Number of months to forecast ahead"
+                )
+            
+            with forecast_col2:
+                spend_scenario = st.selectbox(
+                    "Spend Scenario",
+                    ["Current Levels", "Increase 10%", "Increase 20%", "Decrease 10%", "Decrease 20%", "Custom"],
+                    help="Choose how to adjust spend for forecast"
+                )
+            
+            # Custom spend adjustments if selected
+            if spend_scenario == "Custom":
+                st.markdown("**Custom Spend Adjustments per Channel:**")
+                custom_adjustments = {}
+                for col in media_cols:
+                    channel_name = col.replace('_Cost', '').replace('_cost', '').replace('_Spend', '').replace('_spend', '')
+                    adj = st.slider(
+                        f"{channel_name} Adjustment",
+                        -50, 100, 0, 5,
+                        key=f'forecast_adj_{col}',
+                        help=f"% change in {channel_name} spend"
+                    )
+                    custom_adjustments[col] = 1 + (adj / 100)
+            
+            if st.button("🚀 Generate Forecast", type="primary"):
+                with st.spinner("Generating monthly forecast..."):
+                    try:
+                        # Get last date from test data
+                        last_date = pd.to_datetime(test_df[date_col]).max()
+                        
+                        # Generate future dates (daily, then aggregate to monthly)
+                        forecast_days = forecast_months * 30
+                        future_dates = pd.date_range(start=last_date + pd.Timedelta(days=1), periods=forecast_days, freq='D')
+                        
+                        forecast_data = pd.DataFrame({'date': future_dates})
+                        forecast_data['date'] = pd.to_datetime(forecast_data['date'])
+                        
+                        # Add seasonality features
+                        forecast_data['day_of_week'] = forecast_data['date'].dt.dayofweek
+                        forecast_data['month'] = forecast_data['date'].dt.month
+                        
+                        # Create day of week and month dummies
+                        day_dummies = pd.get_dummies(forecast_data['day_of_week'], prefix='dow', drop_first=True)
+                        month_dummies = pd.get_dummies(forecast_data['month'], prefix='month', drop_first=True)
+                        forecast_data = pd.concat([forecast_data, day_dummies, month_dummies], axis=1)
+                        
+                        # Add media spend (based on scenario)
+                        spend_multiplier = {
+                            "Current Levels": 1.0,
+                            "Increase 10%": 1.1,
+                            "Increase 20%": 1.2,
+                            "Decrease 10%": 0.9,
+                            "Decrease 20%": 0.8
+                        }
+                        
+                        for media_col in media_cols:
+                            avg_spend = test_df[media_col].mean()
+                            
+                            if spend_scenario == "Custom":
+                                forecast_data[media_col] = avg_spend * custom_adjustments[media_col]
+                            else:
+                                forecast_data[media_col] = avg_spend * spend_multiplier[spend_scenario]
+                            
+                            # Apply adstock and saturation transformations
+                            ch_adstock = channel_params[media_col]['adstock']
+                            ch_slope = channel_params[media_col]['hill_slope']
+                            
+                            feat = [f for f in feat_cols if meta[f]['spend_col'] == media_col][0]
+                            kappa = meta[feat]['kappa']
+                            mu = meta[feat]['mu']
+                            sd = meta[feat]['sd']
+                            
+                            # Adstock
+                            forecast_data[f'{media_col}_adstock'] = adstock_transformation(
+                                forecast_data[media_col].values, alpha=ch_adstock
+                            )
+                            
+                            # Saturation
+                            forecast_data[f'{media_col}_saturated'] = hill_transformation(
+                                forecast_data[f'{media_col}_adstock'].values,
+                                kappa=kappa,
+                                slope=ch_slope
+                            )
+                            
+                            # Standardize
+                            forecast_data[feat] = (forecast_data[f'{media_col}_saturated'] - mu) / sd
+                        
+                        # Add control variables (use mean from test)
+                        if control_cols:
+                            for ctrl in control_cols:
+                                forecast_data[ctrl] = test_df[ctrl].mean()
+                        
+                        # Prepare X for prediction
+                        seasonality_cols = [col for col in forecast_data.columns if 'dow_' in col or 'month_' in col]
+                        
+                        X_forecast = pd.concat([
+                            pd.Series(1.0, index=forecast_data.index, name='const'),
+                            forecast_data[feat_cols],
+                            forecast_data[control_cols] if control_cols else pd.DataFrame(index=forecast_data.index),
+                            forecast_data[seasonality_cols]
+                        ], axis=1)
+                        
+                        # Ensure same columns as training
+                        X_forecast = X_forecast.reindex(columns=X_train.columns, fill_value=0).astype('float64')
+                        
+                        # Predict
+                        forecast_data['predicted_revenue'] = model.predict(X_forecast)
+                        
+                        # Aggregate to monthly
+                        forecast_data['year_month'] = forecast_data['date'].dt.to_period('M')
+                        monthly_forecast = forecast_data.groupby('year_month').agg({
+                            'predicted_revenue': 'sum',
+                            **{col: 'sum' for col in media_cols}
+                        }).reset_index()
+                        
+                        monthly_forecast['year_month'] = monthly_forecast['year_month'].astype(str)
+                        monthly_forecast.columns = ['Month', 'Forecasted Revenue'] + [f"{col.replace('_Cost', '').replace('_cost', '')} Spend" for col in media_cols]
+                        
+                        # Calculate total spend and ROI
+                        spend_cols_renamed = [col for col in monthly_forecast.columns if 'Spend' in col]
+                        monthly_forecast['Total Spend'] = monthly_forecast[spend_cols_renamed].sum(axis=1)
+                        monthly_forecast['Forecast ROI'] = monthly_forecast['Forecasted Revenue'] / monthly_forecast['Total Spend']
+                        
+                        # Display results
+                        st.markdown("---")
+                        st.markdown("### 📊 Monthly Forecast Table")
+                        
+                        st.dataframe(
+                            monthly_forecast.style.format({
+                                'Forecasted Revenue': '{:,.0f}',
+                                'Total Spend': '{:,.0f}',
+                                'Forecast ROI': '{:.2f}',
+                                **{col: '{:,.0f}' for col in spend_cols_renamed}
+                            }).background_gradient(subset=['Forecasted Revenue', 'Forecast ROI'], cmap='Greens'),
+                            use_container_width=True,
+                            height=400
+                        )
+                        
+                        # Summary metrics
+                        st.markdown("---")
+                        st.markdown("### 📈 Forecast Summary")
+                        
+                        summary_col1, summary_col2, summary_col3, summary_col4 = st.columns(4)
+                        
+                        with summary_col1:
+                            total_forecast_revenue = monthly_forecast['Forecasted Revenue'].sum()
+                            st.metric("Total Forecasted Revenue", f"${total_forecast_revenue:,.0f}")
+                        
+                        with summary_col2:
+                            total_forecast_spend = monthly_forecast['Total Spend'].sum()
+                            st.metric("Total Planned Spend", f"${total_forecast_spend:,.0f}")
+                        
+                        with summary_col3:
+                            avg_monthly_revenue = monthly_forecast['Forecasted Revenue'].mean()
+                            st.metric("Avg Monthly Revenue", f"${avg_monthly_revenue:,.0f}")
+                        
+                        with summary_col4:
+                            overall_roi = total_forecast_revenue / total_forecast_spend if total_forecast_spend > 0 else 0
+                            st.metric("Overall Forecast ROI", f"{overall_roi:.2f}")
+                        
+                        # Visualization
+                        st.markdown("---")
+                        st.markdown("### 📉 Forecast Visualization")
+                        
+                        fig, ax = plt.subplots(figsize=(12, 6))
+                        
+                        x_pos = range(len(monthly_forecast))
+                        ax.bar(x_pos, monthly_forecast['Forecasted Revenue'], color='steelblue', alpha=0.7, label='Forecasted Revenue')
+                        ax.set_xlabel('Month', fontsize=12)
+                        ax.set_ylabel('Revenue', fontsize=12)
+                        ax.set_title(f'Monthly Revenue Forecast - {spend_scenario} Scenario', fontsize=14, fontweight='bold')
+                        ax.set_xticks(x_pos)
+                        ax.set_xticklabels(monthly_forecast['Month'], rotation=45, ha='right')
+                        ax.legend()
+                        ax.grid(axis='y', alpha=0.3)
+                        
+                        # Add value labels on bars
+                        for i, v in enumerate(monthly_forecast['Forecasted Revenue']):
+                            ax.text(i, v, f'${v/1000:.0f}K', ha='center', va='bottom', fontsize=9)
+                        
+                        plt.tight_layout()
+                        st.pyplot(fig)
+                        
+                        # Download button
+                        st.markdown("---")
+                        csv = monthly_forecast.to_csv(index=False)
+                        st.download_button(
+                            label="📥 Download Forecast CSV",
+                            data=csv,
+                            file_name=f"mmm_forecast_{datetime.now().strftime('%Y%m%d')}.csv",
+                            mime="text/csv"
+                        )
+                        
+                    except Exception as e:
+                        st.error(f"Error generating forecast: {str(e)}")
+                        import traceback
+                        st.code(traceback.format_exc())
+        
+        # Tab 6: Model Summary
+        with result_tabs[5]:
             st.markdown("### Model Summary")
             
             # Model coefficients
