@@ -567,16 +567,79 @@ elif tab_selection == "🎯 Marketing Mix Modeling":
         st.markdown("---")
         st.markdown("### ⚙️ Model Parameters")
         
-        param_col1, param_col2, param_col3 = st.columns(3)
+        # Option to use global or channel-specific parameters
+        use_channel_specific = st.checkbox(
+            "🎯 Use channel-specific parameters (Recommended for channels with different spend levels)",
+            value=True,
+            help="Allows different adstock and saturation curves per channel. Essential when channels have very different spend ranges."
+        )
         
-        with param_col1:
-            adstock_alpha = st.slider("Adstock Rate (α)", 0.0, 0.9, 0.5, 0.05, help="Carryover effect of advertising")
-        
-        with param_col2:
-            hill_slope = st.slider("Hill Slope", 0.5, 2.0, 1.0, 0.1, help="Saturation curve shape")
-        
-        with param_col3:
-            train_test_split = st.slider("Train/Test Split", 0.6, 0.9, 0.8, 0.05, help="Proportion of data for training")
+        if not use_channel_specific:
+            # Global parameters (old approach)
+            st.info("ℹ️ Using same parameters for all channels. Consider channel-specific for better accuracy.")
+            param_col1, param_col2, param_col3 = st.columns(3)
+            
+            with param_col1:
+                adstock_alpha = st.slider("Adstock Rate (α)", 0.0, 0.9, 0.5, 0.05, help="Carryover effect of advertising")
+            
+            with param_col2:
+                hill_slope = st.slider("Hill Slope", 0.5, 2.0, 1.0, 0.1, help="Saturation curve shape")
+            
+            with param_col3:
+                train_test_split = st.slider("Train/Test Split", 0.6, 0.9, 0.8, 0.05, help="Proportion of data for training")
+            
+            # Create dict with same params for all channels
+            channel_params = {col: {'adstock': adstock_alpha, 'hill_slope': hill_slope} for col in media_cols}
+            
+        else:
+            # Channel-specific parameters
+            st.markdown("**📊 Set parameters for each channel:**")
+            st.info("""
+            💡 **Quick Guide:**
+            - **High-spend channels** (Google): Higher adstock (0.6-0.8) + Lower slope (0.7-0.9) = Gentler saturation
+            - **Low-spend channels** (Facebook): Lower adstock (0.3-0.5) + Higher slope (1.2-1.5) = Sharper saturation
+            """)
+            
+            channel_params = {}
+            
+            # Create expandable sections for each channel
+            for media_col in media_cols:
+                channel_name = media_col.replace('_Cost', '').replace('_cost', '').replace('_Spend', '').replace('_spend', '')
+                
+                with st.expander(f"⚙️ {channel_name} Parameters", expanded=True):
+                    col1, col2 = st.columns(2)
+                    
+                    with col1:
+                        adstock = st.slider(
+                            f"Adstock Rate",
+                            0.0, 0.9, 0.5, 0.05,
+                            key=f'adstock_{media_col}',
+                            help=f"Carryover effect for {channel_name}. Higher = longer lasting impact."
+                        )
+                    
+                    with col2:
+                        slope = st.slider(
+                            f"Hill Slope",
+                            0.5, 2.0, 1.0, 0.1,
+                            key=f'slope_{media_col}',
+                            help=f"Saturation curve for {channel_name}. Lower = gentler, Higher = sharper."
+                        )
+                    
+                    channel_params[media_col] = {'adstock': adstock, 'hill_slope': slope}
+                    
+                    # Show quick interpretation
+                    if adstock > 0.6 and slope < 1.0:
+                        st.success(f"✅ Configuration suggests: Long-lasting, gradual saturation (good for high-spend brand channel)")
+                    elif adstock < 0.5 and slope > 1.2:
+                        st.warning(f"⚠️ Configuration suggests: Quick impact, sharp saturation (good for performance channel)")
+            
+            # Train/test split (global)
+            train_test_split = st.slider(
+                "Train/Test Split", 
+                0.6, 0.9, 0.8, 0.05, 
+                help="Proportion of data for training",
+                key='train_test_split_global'
+            )
         
         # Add control variables option
         st.markdown("**Control Variables (Optional):**")
@@ -610,12 +673,16 @@ elif tab_selection == "🎯 Marketing Mix Modeling":
                     feat_cols = []
                     
                     for media_col in media_cols:
-                        # Adstock
+                        # Get channel-specific parameters
+                        ch_adstock = channel_params[media_col]['adstock']
+                        ch_slope = channel_params[media_col]['hill_slope']
+                        
+                        # Adstock with channel-specific rate
                         weekly_df[f'{media_col}_adstock'] = adstock_transformation(
-                            weekly_df[media_col].values, alpha=adstock_alpha
+                            weekly_df[media_col].values, alpha=ch_adstock
                         )
                         
-                        # Hill saturation
+                        # Hill saturation with channel-specific slope
                         kappa = np.nanmedian(weekly_df[f'{media_col}_adstock'].values)
                         if not np.isfinite(kappa) or kappa <= 0:
                             kappa = np.nanmean(weekly_df[f'{media_col}_adstock'].values) or 1.0
@@ -623,7 +690,7 @@ elif tab_selection == "🎯 Marketing Mix Modeling":
                         weekly_df[f'{media_col}_saturated'] = hill_transformation(
                             weekly_df[f'{media_col}_adstock'].values,
                             kappa=kappa,
-                            slope=hill_slope
+                            slope=ch_slope
                         )
                         
                         # Standardize
@@ -635,11 +702,12 @@ elif tab_selection == "🎯 Marketing Mix Modeling":
                         
                         feat_cols.append(feat_name)
                         
-                        # Store metadata
+                        # Store metadata with channel-specific params
                         meta[feat_name] = {
                             'spend_col': media_col,
                             'kappa': kappa,
-                            'slope': hill_slope,
+                            'slope': ch_slope,
+                            'adstock': ch_adstock,
                             'mu': mu,
                             'sd': sd
                         }
@@ -698,7 +766,7 @@ elif tab_selection == "🎯 Marketing Mix Modeling":
                     st.session_state.y_test = y_test
                     st.session_state.y_train_pred = y_train_pred
                     st.session_state.y_test_pred = y_test_pred
-                    st.session_state.adstock_alpha = adstock_alpha
+                    st.session_state.channel_params = channel_params  # Store all channel params
                     
                     st.success("✅ Model trained successfully!")
                     st.balloons()
@@ -773,7 +841,7 @@ elif tab_selection == "📈 Results & Insights":
         X_test = st.session_state.X_test
         y_test = st.session_state.y_test
         y_test_pred = st.session_state.y_test_pred
-        adstock_alpha = st.session_state.adstock_alpha
+        channel_params = st.session_state.channel_params  # Get channel-specific params
         
         # Tabs for different analyses
         result_tabs = st.tabs([
@@ -856,15 +924,16 @@ elif tab_selection == "📈 Results & Insights":
                 # ROI (iROAS)
                 roi = contrib / total_spend if total_spend > 0 else 0
                 
-                # Marginal ROI at current spend
+                # Marginal ROI at current spend (use channel-specific adstock)
                 kappa = meta[feat]['kappa']
                 slope = meta[feat]['slope']
                 sd = meta[feat]['sd']
+                ch_adstock = meta[feat]['adstock']  # Channel-specific adstock
                 
                 current_avg_spend = test_df[channel_name].mean()
-                A = current_avg_spend / (1 - adstock_alpha)
+                A = current_avg_spend / (1 - ch_adstock)
                 
-                marginal_roas = (beta / sd) * hill_derivative(A, kappa, slope) / (1 - adstock_alpha)
+                marginal_roas = (beta / sd) * hill_derivative(A, kappa, slope) / (1 - ch_adstock)
                 
                 roi_data.append({
                     'Channel': channel_name.replace('_Cost', '').replace('_cost', ''),
@@ -957,20 +1026,21 @@ elif tab_selection == "📈 Results & Insights":
             slope = meta[feat]['slope']
             mu = meta[feat]['mu']
             sd = meta[feat]['sd']
+            ch_adstock = meta[feat]['adstock']  # Channel-specific adstock
             
             # Generate spend range
             historical_spend = test_df[selected_channel].values
             max_spend = np.percentile(historical_spend, 95)
             spend_range = np.linspace(0, max_spend * 1.5, 200)
             
-            # Calculate responses
-            adstocked = spend_range / (1 - adstock_alpha)
+            # Calculate responses (use channel-specific adstock)
+            adstocked = spend_range / (1 - ch_adstock)
             saturated = hill_transformation(adstocked, kappa, slope)
             standardized = (saturated - mu) / sd
             revenue = beta * standardized
             
-            # Calculate marginal ROAS
-            marginal_roas = (beta / sd) * hill_derivative(adstocked, kappa, slope) / (1 - adstock_alpha)
+            # Calculate marginal ROAS (use channel-specific adstock)
+            marginal_roas = (beta / sd) * hill_derivative(adstocked, kappa, slope) / (1 - ch_adstock)
             
             # Calculate iROAS
             iroas = np.zeros_like(revenue)
@@ -1086,10 +1156,11 @@ elif tab_selection == "📈 Results & Insights":
                 kappa = meta[feat]['kappa']
                 slope = meta[feat]['slope']
                 sd = meta[feat]['sd']
+                ch_adstock = meta[feat]['adstock']  # Channel-specific adstock
                 
                 current_spend = test_df[channel_name].mean()
-                A = current_spend / (1 - adstock_alpha)
-                marginal_roas = (beta / sd) * hill_derivative(A, kappa, slope) / (1 - adstock_alpha)
+                A = current_spend / (1 - ch_adstock)
+                marginal_roas = (beta / sd) * hill_derivative(A, kappa, slope) / (1 - ch_adstock)
                 
                 allocation_data.append({
                     'Channel': channel_name.replace('_Cost', '').replace('_cost', ''),
@@ -1279,11 +1350,12 @@ Adjusted R-squared: {model.rsquared_adj:.4f}
 MAPE (Test): {calculate_metrics(y_test, y_test_pred)[1]:.2%}
 wMAPE (Test): {calculate_metrics(y_test, y_test_pred)[2]:.2%}
 
-=== MODEL PARAMETERS ===
-Adstock Alpha: {adstock_alpha}
-Hill Slope: {meta[feat_cols[0]]['slope']}
+=== MODEL PARAMETERS (Channel-Specific) ===
 Training Samples: {len(st.session_state.y_train)}
 Test Samples: {len(y_test)}
+
+Channel Parameters:
+{chr(10).join([f"  {meta[f]['spend_col']}: Adstock={meta[f]['adstock']:.2f}, Slope={meta[f]['slope']:.2f}, Kappa={meta[f]['kappa']:.2f}" for f in feat_cols])}
 
 === CHANNEL CONTRIBUTIONS ===
 {contrib_df.to_string()}
