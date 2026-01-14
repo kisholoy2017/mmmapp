@@ -762,6 +762,7 @@ elif tab_selection == "🎯 Marketing Mix Modeling":
                     st.session_state.feat_cols = feat_cols
                     st.session_state.media_cols = media_cols
                     st.session_state.target_col = target_col
+                    st.session_state.date_col = date_col
                     st.session_state.train_df = train_df
                     st.session_state.test_df = test_df
                     st.session_state.X_train = X_train
@@ -841,6 +842,7 @@ elif tab_selection == "📈 Results & Insights":
         feat_cols = st.session_state.feat_cols
         media_cols = st.session_state.media_cols
         target_col = st.session_state.target_col
+        date_col = st.session_state.date_col
         test_df = st.session_state.test_df
         X_test = st.session_state.X_test
         y_test = st.session_state.y_test
