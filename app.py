@@ -6,6 +6,8 @@ import seaborn as sns
 from datetime import datetime, timedelta
 import statsmodels.api as sm
 from scipy import stats
+from scipy.optimize import minimize
+from functools import partial
 import warnings
 warnings.filterwarnings('ignore')
 
@@ -56,6 +58,8 @@ if 'combined_data' not in st.session_state:
     st.session_state.combined_data = None
 if 'model_trained' not in st.session_state:
     st.session_state.model_trained = False
+if 'promotion_data' not in st.session_state:
+    st.session_state.promotion_data = None
 
 # Helper functions for MMM
 def adstock_transformation(x, alpha=0.5):
@@ -87,19 +91,6 @@ def hill_derivative(x, kappa, slope=1.0):
     ks = np.power(k, slope)
     return slope * np.power(x, slope - 1.0) * ks / (xs + ks)**2
 
-def clean_numeric_columns(df):
-    """Clean numeric columns by removing commas and converting to float"""
-    df_cleaned = df.copy()
-    for col in df_cleaned.columns:
-        if df_cleaned[col].dtype == 'object':
-            try:
-                # Try to convert after removing commas
-                df_cleaned[col] = df_cleaned[col].astype(str).str.replace(',', '').astype(float)
-            except (ValueError, AttributeError):
-                # If conversion fails, keep as is
-                pass
-    return df_cleaned
-
 def calculate_metrics(y_true, y_pred):
     """Calculate model performance metrics"""
     # R-squared
@@ -116,24 +107,8 @@ def calculate_metrics(y_true, y_pred):
     
     return r2, mape, wmape
 
-def prepare_data_for_modeling(df, date_col, media_cols, target_col):
-    """Prepare data with weekly aggregation"""
-    df = df.copy()
-    df[date_col] = pd.to_datetime(df[date_col])
-    df['week'] = df[date_col].dt.to_period('W').dt.to_timestamp()
-    
-    # Aggregate to weekly level
-    agg_dict = {target_col: 'sum'}
-    for col in media_cols:
-        agg_dict[col] = 'sum'
-    
-    weekly_data = df.groupby('week').agg(agg_dict).reset_index()
-    weekly_data.columns = ['date'] + [target_col] + media_cols
-    
-    return weekly_data
-
 def add_seasonality_features(df, date_col):
-    """Add seasonality features: day of week and month (for daily data)"""
+    """Add seasonality features: day of week and month"""
     df = df.copy()
     df[date_col] = pd.to_datetime(df[date_col])
     
@@ -152,6 +127,27 @@ def add_seasonality_features(df, date_col):
     
     return df_with_seasonality
 
+def process_promotion_variable(df, promo_col):
+    """
+    Process promotion variable - convert to dummy if string, use as numeric if numeric
+    Returns: tuple (processed_df, promotion_feature_cols, is_dummy)
+    """
+    df = df.copy()
+    
+    # Check if column is string/object type
+    if df[promo_col].dtype == 'object' or df[promo_col].dtype.name == 'category':
+        # String values - convert to dummies
+        promo_dummies = pd.get_dummies(df[promo_col], prefix='promo', drop_first=True)
+        df = pd.concat([df, promo_dummies], axis=1)
+        feature_cols = promo_dummies.columns.tolist()
+        is_dummy = True
+    else:
+        # Numeric values - use as is
+        feature_cols = [promo_col]
+        is_dummy = False
+    
+    return df, feature_cols, is_dummy
+
 # Main app
 st.markdown('<p class="main-header">📊 Marketing Mix Modeling Platform</p>', unsafe_allow_html=True)
 
@@ -169,9 +165,10 @@ with st.sidebar:
     st.markdown("### About")
     st.info("""
     This platform helps you:
-    - Upload media spend data
+    - Upload media spend & KPI data
+    - Add promotion/discount variables
     - Analyze marketing effectiveness
-    - Optimize budget allocation
+    - Optimize budget allocation (scipy)
     - Generate actionable insights
     """)
 
@@ -237,6 +234,42 @@ if tab_selection == "📤 Data Upload":
                 except Exception as e:
                     st.error(f"Error loading {channel_name}: {str(e)}")
     
+    # Promotion/Discount variable upload
+    st.markdown("---")
+    st.markdown("#### 🎁 Promotion/Discount Data (Optional)")
+    st.info("""
+    Upload promotion data with **Date** and **Promotion** columns.
+    - **String values** (e.g., 'Yes'/'No', 'Sale'/'Normal') → Converted to dummy variables
+    - **Numeric values** (e.g., 10%, 0.15) → Used as continuous variable
+    """)
+    
+    promo_file = st.file_uploader(
+        "Upload Promotion CSV (optional)",
+        type=['csv'],
+        key='promo_upload',
+        help="CSV with Date and Promotion columns"
+    )
+    
+    if promo_file:
+        try:
+            promo_df = pd.read_csv(promo_file)
+            st.session_state.promotion_data = promo_df
+            
+            st.success(f"✅ Promotion data uploaded! ({len(promo_df)} rows)")
+            
+            with st.expander("Preview Promotion Data"):
+                st.dataframe(promo_df.head(10), use_container_width=True)
+                
+                # Detect type
+                promo_col = promo_df.columns[1]
+                if promo_df[promo_col].dtype == 'object':
+                    st.info(f"✓ Detected **categorical** promotion: {promo_df[promo_col].unique()}")
+                else:
+                    st.info(f"✓ Detected **numeric** promotion: Range {promo_df[promo_col].min():.2f} - {promo_df[promo_col].max():.2f}")
+                    
+        except Exception as e:
+            st.error(f"Error loading promotion data: {str(e)}")
+    
     # Combine data button
     st.markdown("---")
     if st.button("🔗 Combine All Data", type="primary", use_container_width=True):
@@ -269,12 +302,24 @@ if tab_selection == "📤 Data Upload":
                         channel_df = channel_df.rename(columns={channel_date_col: date_col})
                         combined = combined.merge(channel_df, on=date_col, how='left')
                     
+                    # Merge promotion data if available
+                    if st.session_state.promotion_data is not None:
+                        promo_df = st.session_state.promotion_data.copy()
+                        promo_date_col = promo_df.columns[0]
+                        promo_df[promo_date_col] = pd.to_datetime(promo_df[promo_date_col])
+                        promo_df = promo_df.rename(columns={promo_date_col: date_col})
+                        combined = combined.merge(promo_df, on=date_col, how='left')
+                        
+                        # Fill missing promotion values
+                        promo_col = promo_df.columns[1]
+                        if combined[promo_col].dtype == 'object':
+                            combined[promo_col] = combined[promo_col].fillna('None')
+                        else:
+                            combined[promo_col] = combined[promo_col].fillna(0)
+                    
                     # Fill NaN with 0 for cost columns
                     cost_cols = [col for col in combined.columns if 'cost' in col.lower() or 'spend' in col.lower()]
                     combined[cost_cols] = combined[cost_cols].fillna(0)
-                    
-                    # Clean numeric columns (remove commas, convert to float)
-                    combined = clean_numeric_columns(combined)
                     
                     st.session_state.combined_data = combined
                     st.session_state.data_uploaded = True
@@ -326,14 +371,14 @@ elif tab_selection == "🔍 Data Overview":
         st.markdown("---")
         st.markdown("### ✅ Data Validation")
         
-        validation_col1, validation_col2 = st.columns(2)
+        validation_col1, validation_col2, validation_col3 = st.columns(3)
         
         with validation_col1:
-            # Check for minimum 20 months
-            if date_range_months >= 20:
-                st.success(f"✅ Sufficient data: {date_range_months:.1f} months (≥20 months required)")
+            # Check for minimum 24 months
+            if date_range_months >= 24:
+                st.success(f"✅ Sufficient data: {date_range_months:.1f} months (≥24 months required)")
             else:
-                st.error(f"❌ Insufficient data: {date_range_months:.1f} months (<20 months)")
+                st.error(f"❌ Insufficient data: {date_range_months:.1f} months (<24 months)")
         
         with validation_col2:
             # Check for required columns
@@ -343,22 +388,24 @@ elif tab_selection == "🔍 Data Overview":
             else:
                 st.error("❌ Revenue column not found")
         
+        with validation_col3:
+            # Check for promotion data
+            has_promo = any('promo' in col.lower() or 'discount' in col.lower() for col in df.columns)
+            if has_promo:
+                st.success("✅ Promotion data included")
+            else:
+                st.info("ℹ️ No promotion data")
+        
         # Display combined data
         st.markdown("---")
         st.markdown("### 📊 Combined Dataset")
         
-        # Styled dataframe - only apply gradient to numeric columns
-        numeric_cols = df.select_dtypes(include=[np.number]).columns.tolist()
-        numeric_cols = [col for col in numeric_cols if col != date_col]
-        
-        if numeric_cols:
-            st.dataframe(
-                df.style.background_gradient(subset=numeric_cols, cmap='Blues'),
-                use_container_width=True,
-                height=400
-            )
-        else:
-            st.dataframe(df, use_container_width=True, height=400)
+        # Styled dataframe
+        st.dataframe(
+            df.style.background_gradient(subset=[col for col in df.columns if col != date_col], cmap='Blues'),
+            use_container_width=True,
+            height=400
+        )
         
         # Download button
         csv = df.to_csv(index=False)
@@ -392,122 +439,14 @@ elif tab_selection == "🔍 Data Overview":
         st.markdown("---")
         st.markdown("### 🔥 Correlation Heatmap")
         
-        # Get numeric columns excluding date
         numeric_cols = df.select_dtypes(include=[np.number]).columns.tolist()
-        
         if len(numeric_cols) > 1:
-            fig, ax = plt.subplots(figsize=(14, 10))
+            fig, ax = plt.subplots(figsize=(12, 8))
             correlation_matrix = df[numeric_cols].corr()
-            
-            # Create heatmap with better visibility
-            sns.heatmap(
-                correlation_matrix, 
-                annot=True, 
-                fmt='.2f', 
-                cmap='coolwarm', 
-                center=0, 
-                ax=ax,
-                square=True,
-                linewidths=0.5,
-                cbar_kws={"shrink": 0.8}
-            )
-            plt.title('Correlation Matrix: Media Channels & KPI', fontsize=16, fontweight='bold', pad=20)
-            plt.xticks(rotation=45, ha='right')
-            plt.yticks(rotation=0)
+            sns.heatmap(correlation_matrix, annot=True, fmt='.2f', cmap='coolwarm', center=0, ax=ax)
+            plt.title('Correlation Matrix of Media Channels and KPI', fontsize=16, fontweight='bold')
             plt.tight_layout()
             st.pyplot(fig)
-            
-            # Show which columns are included
-            with st.expander("ℹ️ Columns in Correlation Matrix"):
-                st.write(f"**{len(numeric_cols)} numeric columns:**")
-                st.write(", ".join(numeric_cols))
-        else:
-            st.warning(f"⚠️ Need at least 2 numeric columns for correlation. Found: {len(numeric_cols)}")
-        
-        # Spend vs Revenue plots for each media channel
-        st.markdown("---")
-        st.markdown("### 💰 Spend vs Revenue Analysis by Channel")
-        st.info("These scatter plots show the relationship between media spend and revenue for each channel over the entire time period.")
-        
-        # Identify media spend columns and revenue column
-        spend_cols = [col for col in df.columns if 'cost' in col.lower() or 'spend' in col.lower()]
-        revenue_cols = [col for col in df.columns if 'revenue' in col.lower() or 'sales' in col.lower()]
-        
-        if spend_cols and revenue_cols:
-            revenue_col = revenue_cols[0]  # Use first revenue column found
-            
-            # Create grid of plots
-            num_channels = len(spend_cols)
-            if num_channels > 0:
-                cols_per_row = 2
-                num_rows = (num_channels + cols_per_row - 1) // cols_per_row
-                
-                fig, axes = plt.subplots(num_rows, cols_per_row, figsize=(14, 5*num_rows))
-                if num_rows == 1 and cols_per_row == 1:
-                    axes = np.array([[axes]])
-                elif num_rows == 1:
-                    axes = axes.reshape(1, -1)
-                elif cols_per_row == 1:
-                    axes = axes.reshape(-1, 1)
-                
-                for idx, spend_col in enumerate(spend_cols):
-                    row = idx // cols_per_row
-                    col = idx % cols_per_row
-                    ax = axes[row, col]
-                    
-                    # Create scatter plot
-                    x_data = df[spend_col].values
-                    y_data = df[revenue_col].values
-                    
-                    # Remove any NaN or infinite values
-                    mask = np.isfinite(x_data) & np.isfinite(y_data)
-                    x_clean = x_data[mask]
-                    y_clean = y_data[mask]
-                    
-                    if len(x_clean) > 0:
-                        ax.scatter(x_clean, y_clean, alpha=0.6, s=50, color='steelblue')
-                        
-                        # Add trend line if enough data points
-                        if len(x_clean) > 2:
-                            z = np.polyfit(x_clean, y_clean, 1)
-                            p = np.poly1d(z)
-                            x_line = np.linspace(x_clean.min(), x_clean.max(), 100)
-                            ax.plot(x_line, p(x_line), "r--", alpha=0.8, linewidth=2, label='Trend')
-                            ax.legend()
-                        
-                        # Calculate correlation
-                        if len(x_clean) > 1:
-                            corr = np.corrcoef(x_clean, y_clean)[0, 1]
-                            ax.text(0.05, 0.95, f'Corr: {corr:.2f}', 
-                                   transform=ax.transAxes, 
-                                   fontsize=10, 
-                                   verticalalignment='top',
-                                   bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
-                    
-                    channel_name = spend_col.replace('_Cost', '').replace('_cost', '').replace('_Spend', '').replace('_spend', '')
-                    ax.set_title(f'{channel_name}', fontsize=12, fontweight='bold')
-                    ax.set_xlabel('Spend', fontsize=10)
-                    ax.set_ylabel('Revenue', fontsize=10)
-                    ax.grid(True, alpha=0.3)
-                
-                # Hide empty subplots
-                for idx in range(num_channels, num_rows * cols_per_row):
-                    row = idx // cols_per_row
-                    col = idx % cols_per_row
-                    fig.delaxes(axes[row, col])
-                
-                plt.tight_layout()
-                st.pyplot(fig)
-                
-                st.markdown("""
-                **💡 What to look for:**
-                - **Positive correlation**: Higher spend → Higher revenue (good!)
-                - **Scattered points**: Inconsistent performance or other factors at play
-                - **Flat trend**: Channel may not be driving incremental revenue
-                - **Strong trend line**: Clear relationship between spend and outcomes
-                """)
-        else:
-            st.warning("⚠️ Could not find spend and revenue columns for analysis.")
 
 # TAB 3: Marketing Mix Modeling
 elif tab_selection == "🎯 Marketing Mix Modeling":
@@ -524,8 +463,8 @@ elif tab_selection == "🎯 Marketing Mix Modeling":
         # Check data sufficiency
         date_range_months = (df[date_col].max() - df[date_col].min()).days / 30
         
-        if date_range_months < 20:
-            st.error(f"❌ Insufficient data for modeling: {date_range_months:.1f} months available (20 months required)")
+        if date_range_months < 24:
+            st.error(f"❌ Insufficient data for modeling: {date_range_months:.1f} months available (24 months required)")
             st.stop()
         
         st.success(f"✅ Data validation passed: {date_range_months:.1f} months available")
@@ -566,128 +505,83 @@ elif tab_selection == "🎯 Marketing Mix Modeling":
             st.warning("⚠️ Please select at least one media spend column!")
             st.stop()
         
+        # Promotion variable selection
+        st.markdown("**Promotion/Discount Variable (Optional):**")
+        promo_options = [col for col in df.columns if ('promo' in col.lower() or 'discount' in col.lower()) 
+                         and col not in media_cols and col != target_col and col != date_col]
+        
+        promo_col = None
+        if promo_options:
+            use_promo = st.checkbox("Include promotion variable", value=True)
+            if use_promo:
+                promo_col = st.selectbox("Select promotion column", promo_options, key='promo_col_selector')
+        
+        # Other control variables
+        st.markdown("**Other Control Variables (Optional):**")
+        available_controls = [col for col in df.columns if col not in media_cols and col != target_col 
+                             and col != date_col and col != promo_col 
+                             and not ('promo' in col.lower() or 'discount' in col.lower())]
+        control_cols = st.multiselect(
+            "Select additional control variables",
+            available_controls,
+            key='other_controls_selector'
+        )
+        
         # Model parameters
         st.markdown("---")
         st.markdown("### ⚙️ Model Parameters")
         
-        # Option to use global or channel-specific parameters
-        use_channel_specific = st.checkbox(
-            "🎯 Use channel-specific parameters (Recommended for channels with different spend levels)",
-            value=True,
-            help="Allows different adstock and saturation curves per channel. Essential when channels have very different spend ranges."
-        )
+        param_col1, param_col2, param_col3 = st.columns(3)
         
-        if not use_channel_specific:
-            # Global parameters (old approach)
-            st.info("ℹ️ Using same parameters for all channels. Consider channel-specific for better accuracy.")
-            param_col1, param_col2, param_col3 = st.columns(3)
-            
-            with param_col1:
-                adstock_alpha = st.slider("Adstock Rate (α)", 0.0, 0.9, 0.5, 0.05, help="Carryover effect of advertising")
-            
-            with param_col2:
-                hill_slope = st.slider("Hill Slope", 0.5, 2.0, 1.0, 0.1, help="Saturation curve shape")
-            
-            with param_col3:
-                train_test_split = st.slider("Train/Test Split", 0.6, 0.9, 0.8, 0.05, help="Proportion of data for training")
-            
-            # Create dict with same params for all channels
-            channel_params = {col: {'adstock': adstock_alpha, 'hill_slope': hill_slope} for col in media_cols}
-            
-        else:
-            # Channel-specific parameters
-            st.markdown("**📊 Set parameters for each channel:**")
-            st.info("""
-            💡 **Quick Guide:**
-            - **High-spend channels** (Google): Higher adstock (0.6-0.8) + Lower slope (0.7-0.9) = Gentler saturation
-            - **Low-spend channels** (Facebook): Lower adstock (0.3-0.5) + Higher slope (1.2-1.5) = Sharper saturation
-            """)
-            
-            channel_params = {}
-            
-            # Create expandable sections for each channel
-            for media_col in media_cols:
-                channel_name = media_col.replace('_Cost', '').replace('_cost', '').replace('_Spend', '').replace('_spend', '')
-                
-                with st.expander(f"⚙️ {channel_name} Parameters", expanded=True):
-                    col1, col2 = st.columns(2)
-                    
-                    with col1:
-                        adstock = st.slider(
-                            f"Adstock Rate",
-                            0.0, 0.9, 0.5, 0.05,
-                            key=f'adstock_{media_col}',
-                            help=f"Carryover effect for {channel_name}. Higher = longer lasting impact."
-                        )
-                    
-                    with col2:
-                        slope = st.slider(
-                            f"Hill Slope",
-                            0.5, 2.0, 1.0, 0.1,
-                            key=f'slope_{media_col}',
-                            help=f"Saturation curve for {channel_name}. Lower = gentler, Higher = sharper."
-                        )
-                    
-                    channel_params[media_col] = {'adstock': adstock, 'hill_slope': slope}
-                    
-                    # Show quick interpretation
-                    if adstock > 0.6 and slope < 1.0:
-                        st.success(f"✅ Configuration suggests: Long-lasting, gradual saturation (good for high-spend brand channel)")
-                    elif adstock < 0.5 and slope > 1.2:
-                        st.warning(f"⚠️ Configuration suggests: Quick impact, sharp saturation (good for performance channel)")
-            
-            # Train/test split (global)
-            train_test_split = st.slider(
-                "Train/Test Split", 
-                0.6, 0.9, 0.8, 0.05, 
-                help="Proportion of data for training",
-                key='train_test_split_global'
-            )
+        with param_col1:
+            adstock_alpha = st.slider("Adstock Rate (α)", 0.0, 0.9, 0.5, 0.05, help="Carryover effect of advertising")
         
-        # Add control variables option
-        st.markdown("**Control Variables (Optional):**")
-        control_cols = st.multiselect(
-            "Select control variables",
-            [col for col in df.columns if col not in media_cols and col != target_col and col != date_col],
-            key='control_cols_selector'
-        )
+        with param_col2:
+            hill_slope = st.slider("Hill Slope", 0.5, 2.0, 1.0, 0.1, help="Saturation curve shape")
+        
+        with param_col3:
+            train_test_split = st.slider("Train/Test Split", 0.6, 0.9, 0.8, 0.05, help="Proportion of data for training")
         
         # Run model button
         st.markdown("---")
         if st.button("🚀 Run Marketing Mix Model", type="primary", use_container_width=True):
             with st.spinner("Training Marketing Mix Model... This may take a few minutes."):
                 try:
-                    # Clean data first (remove commas, convert to numeric)
-                    st.info("Step 1/6: Cleaning and validating data...")
-                    df = clean_numeric_columns(df)
-                    
-                    # Prepare daily data (no aggregation)
-                    st.info("Step 2/6: Preparing daily data...")
+                    # Work with daily data
+                    st.info("Step 1/7: Preparing daily data...")
                     daily_df = df.copy()
-                    daily_df[date_col] = pd.to_datetime(daily_df[date_col])
                     daily_df = daily_df.sort_values(date_col).reset_index(drop=True)
                     
-                    # Add seasonality (day of week + month)
-                    st.info("Step 3/6: Adding seasonality features (day of week + month)...")
+                    # Add seasonality
+                    st.info("Step 2/7: Adding seasonality features...")
                     daily_df = add_seasonality_features(daily_df, date_col)
                     
-                    # Engineer features
-                    st.info("Step 4/6: Engineering media features (adstock + saturation)...")
+                    # Process promotion variable if selected
+                    promo_features = []
+                    promo_is_dummy = False
+                    if promo_col:
+                        st.info(f"Step 3/7: Processing promotion variable ({promo_col})...")
+                        daily_df, promo_features, promo_is_dummy = process_promotion_variable(daily_df, promo_col)
+                        st.session_state.promo_is_dummy = promo_is_dummy
+                        st.session_state.promo_features = promo_features
+                    else:
+                        st.info("Step 3/7: No promotion variable selected, skipping...")
+                        st.session_state.promo_features = []
+                        st.session_state.promo_is_dummy = False
+                    
+                    # Engineer media features
+                    st.info("Step 4/7: Engineering media features (adstock + saturation)...")
                     
                     meta = {}
                     feat_cols = []
                     
                     for media_col in media_cols:
-                        # Get channel-specific parameters
-                        ch_adstock = channel_params[media_col]['adstock']
-                        ch_slope = channel_params[media_col]['hill_slope']
-                        
-                        # Adstock with channel-specific rate
+                        # Adstock
                         daily_df[f'{media_col}_adstock'] = adstock_transformation(
-                            daily_df[media_col].values, alpha=ch_adstock
+                            daily_df[media_col].values, alpha=adstock_alpha
                         )
                         
-                        # Hill saturation with channel-specific slope
+                        # Hill saturation
                         kappa = np.nanmedian(daily_df[f'{media_col}_adstock'].values)
                         if not np.isfinite(kappa) or kappa <= 0:
                             kappa = np.nanmean(daily_df[f'{media_col}_adstock'].values) or 1.0
@@ -695,7 +589,7 @@ elif tab_selection == "🎯 Marketing Mix Modeling":
                         daily_df[f'{media_col}_saturated'] = hill_transformation(
                             daily_df[f'{media_col}_adstock'].values,
                             kappa=kappa,
-                            slope=ch_slope
+                            slope=hill_slope
                         )
                         
                         # Standardize
@@ -707,18 +601,17 @@ elif tab_selection == "🎯 Marketing Mix Modeling":
                         
                         feat_cols.append(feat_name)
                         
-                        # Store metadata with channel-specific params
+                        # Store metadata
                         meta[feat_name] = {
                             'spend_col': media_col,
                             'kappa': kappa,
-                            'slope': ch_slope,
-                            'adstock': ch_adstock,
+                            'slope': hill_slope,
                             'mu': mu,
                             'sd': sd
                         }
                     
                     # Train/test split
-                    st.info("Step 5/6: Splitting data into train and test sets...")
+                    st.info("Step 5/7: Splitting data into train and test sets...")
                     split_idx = int(len(daily_df) * train_test_split)
                     train_df = daily_df.iloc[:split_idx].copy()
                     test_df = daily_df.iloc[split_idx:].copy()
@@ -726,17 +619,20 @@ elif tab_selection == "🎯 Marketing Mix Modeling":
                     # Prepare X and y
                     seasonality_cols = [col for col in daily_df.columns if 'dow_' in col or 'month_' in col]
                     
+                    # Combine all features
+                    all_control_cols = control_cols + promo_features
+                    
                     X_train = pd.concat([
                         pd.Series(1.0, index=train_df.index, name='const'),
                         train_df[feat_cols],
-                        train_df[control_cols] if control_cols else pd.DataFrame(index=train_df.index),
+                        train_df[all_control_cols] if all_control_cols else pd.DataFrame(index=train_df.index),
                         train_df[seasonality_cols]
                     ], axis=1).astype('float64')
                     
                     X_test = pd.concat([
                         pd.Series(1.0, index=test_df.index, name='const'),
                         test_df[feat_cols],
-                        test_df[control_cols] if control_cols else pd.DataFrame(index=test_df.index),
+                        test_df[all_control_cols] if all_control_cols else pd.DataFrame(index=test_df.index),
                         test_df[seasonality_cols]
                     ], axis=1).astype('float64')
                     
@@ -744,7 +640,7 @@ elif tab_selection == "🎯 Marketing Mix Modeling":
                     y_test = test_df[target_col].values.astype(float)
                     
                     # Train model
-                    st.info("Step 6/6: Training OLS regression model...")
+                    st.info("Step 6/7: Training OLS regression model...")
                     model = sm.OLS(y_train, X_train).fit()
                     
                     # Predictions
@@ -752,6 +648,7 @@ elif tab_selection == "🎯 Marketing Mix Modeling":
                     y_test_pred = model.predict(X_test)
                     
                     # Calculate metrics
+                    st.info("Step 7/7: Calculating performance metrics...")
                     train_r2, train_mape, train_wmape = calculate_metrics(y_train, y_train_pred)
                     test_r2, test_mape, test_wmape = calculate_metrics(y_test, y_test_pred)
                     
@@ -763,7 +660,6 @@ elif tab_selection == "🎯 Marketing Mix Modeling":
                     st.session_state.media_cols = media_cols
                     st.session_state.target_col = target_col
                     st.session_state.date_col = date_col
-                    st.session_state.control_cols = control_cols
                     st.session_state.train_df = train_df
                     st.session_state.test_df = test_df
                     st.session_state.X_train = X_train
@@ -772,7 +668,9 @@ elif tab_selection == "🎯 Marketing Mix Modeling":
                     st.session_state.y_test = y_test
                     st.session_state.y_train_pred = y_train_pred
                     st.session_state.y_test_pred = y_test_pred
-                    st.session_state.channel_params = channel_params  # Store all channel params
+                    st.session_state.adstock_alpha = adstock_alpha
+                    st.session_state.promo_col = promo_col
+                    st.session_state.control_cols = control_cols
                     
                     st.success("✅ Model trained successfully!")
                     st.balloons()
@@ -802,8 +700,8 @@ elif tab_selection == "🎯 Marketing Mix Modeling":
                     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
                     
                     # Train
-                    ax1.plot(train_df['date'], y_train, label='Actual', color='green', alpha=0.7)
-                    ax1.plot(train_df['date'], y_train_pred, label='Predicted', color='blue', alpha=0.7)
+                    ax1.plot(train_df[date_col], y_train, label='Actual', color='green', alpha=0.7)
+                    ax1.plot(train_df[date_col], y_train_pred, label='Predicted', color='blue', alpha=0.7)
                     ax1.set_title(f'Training Set (R²={train_r2:.3f})', fontsize=14, fontweight='bold')
                     ax1.set_xlabel('Date')
                     ax1.set_ylabel(target_col)
@@ -811,8 +709,8 @@ elif tab_selection == "🎯 Marketing Mix Modeling":
                     ax1.grid(True, alpha=0.3)
                     
                     # Test
-                    ax2.plot(test_df['date'], y_test, label='Actual', color='green', alpha=0.7)
-                    ax2.plot(test_df['date'], y_test_pred, label='Predicted', color='blue', alpha=0.7)
+                    ax2.plot(test_df[date_col], y_test, label='Actual', color='green', alpha=0.7)
+                    ax2.plot(test_df[date_col], y_test_pred, label='Predicted', color='blue', alpha=0.7)
                     ax2.set_title(f'Test Set (R²={test_r2:.3f})', fontsize=14, fontweight='bold')
                     ax2.set_xlabel('Date')
                     ax2.set_ylabel(target_col)
@@ -844,20 +742,22 @@ elif tab_selection == "📈 Results & Insights":
         media_cols = st.session_state.media_cols
         target_col = st.session_state.target_col
         date_col = st.session_state.date_col
-        control_cols = st.session_state.control_cols
         test_df = st.session_state.test_df
         X_test = st.session_state.X_test
         y_test = st.session_state.y_test
         y_test_pred = st.session_state.y_test_pred
-        channel_params = st.session_state.channel_params  # Get channel-specific params
+        adstock_alpha = st.session_state.adstock_alpha
+        promo_col = st.session_state.promo_col
+        promo_features = st.session_state.promo_features
+        promo_is_dummy = st.session_state.promo_is_dummy
+        control_cols = st.session_state.control_cols
         
         # Tabs for different analyses
         result_tabs = st.tabs([
             "📊 Channel Contribution",
             "💰 ROI Analysis",
             "📈 Response Curves",
-            "🎯 Budget Allocation",
-            "🔮 Monthly Forecast",
+            "🎯 Budget Optimization (Scipy)",
             "📋 Model Summary"
         ])
         
@@ -872,6 +772,15 @@ elif tab_selection == "📈 Results & Insights":
                 contrib = np.sum(X_test[feat].values * beta)
                 channel_name = meta[feat]['spend_col']
                 contributions[channel_name] = contrib
+            
+            # Add promotion contribution
+            if promo_col and promo_features:
+                promo_contrib = 0
+                for promo_feat in promo_features:
+                    if promo_feat in X_test.columns:
+                        beta = float(model.params.get(promo_feat, 0.0))
+                        promo_contrib += np.sum(X_test[promo_feat].values * beta)
+                contributions['Promotion'] = promo_contrib
             
             # Add baseline
             baseline = float(model.params.get('const', 0.0)) * len(X_test)
@@ -933,16 +842,15 @@ elif tab_selection == "📈 Results & Insights":
                 # ROI (iROAS)
                 roi = contrib / total_spend if total_spend > 0 else 0
                 
-                # Marginal ROI at current spend (use channel-specific adstock)
+                # Marginal ROI at current spend
                 kappa = meta[feat]['kappa']
                 slope = meta[feat]['slope']
                 sd = meta[feat]['sd']
-                ch_adstock = meta[feat]['adstock']  # Channel-specific adstock
                 
                 current_avg_spend = test_df[channel_name].mean()
-                A = current_avg_spend / (1 - ch_adstock)
+                A = current_avg_spend / (1 - adstock_alpha)
                 
-                marginal_roas = (beta / sd) * hill_derivative(A, kappa, slope) / (1 - ch_adstock)
+                marginal_roas = (beta / sd) * hill_derivative(A, kappa, slope) / (1 - adstock_alpha)
                 
                 roi_data.append({
                     'Channel': channel_name.replace('_Cost', '').replace('_cost', ''),
@@ -1035,21 +943,20 @@ elif tab_selection == "📈 Results & Insights":
             slope = meta[feat]['slope']
             mu = meta[feat]['mu']
             sd = meta[feat]['sd']
-            ch_adstock = meta[feat]['adstock']  # Channel-specific adstock
             
             # Generate spend range
             historical_spend = test_df[selected_channel].values
             max_spend = np.percentile(historical_spend, 95)
             spend_range = np.linspace(0, max_spend * 1.5, 200)
             
-            # Calculate responses (use channel-specific adstock)
-            adstocked = spend_range / (1 - ch_adstock)
+            # Calculate responses
+            adstocked = spend_range / (1 - adstock_alpha)
             saturated = hill_transformation(adstocked, kappa, slope)
             standardized = (saturated - mu) / sd
             revenue = beta * standardized
             
-            # Calculate marginal ROAS (use channel-specific adstock)
-            marginal_roas = (beta / sd) * hill_derivative(adstocked, kappa, slope) / (1 - ch_adstock)
+            # Calculate marginal ROAS
+            marginal_roas = (beta / sd) * hill_derivative(adstocked, kappa, slope) / (1 - adstock_alpha)
             
             # Calculate iROAS
             iroas = np.zeros_like(revenue)
@@ -1063,7 +970,7 @@ elif tab_selection == "📈 Results & Insights":
             axes[0, 0].plot(spend_range, revenue, color='steelblue', linewidth=2)
             axes[0, 0].axvline(historical_spend.mean(), color='red', linestyle='--', label='Current avg spend')
             axes[0, 0].set_title('Saturation Curve', fontsize=14, fontweight='bold')
-            axes[0, 0].set_xlabel('Weekly Spend', fontsize=11)
+            axes[0, 0].set_xlabel('Daily Spend', fontsize=11)
             axes[0, 0].set_ylabel('Incremental Revenue', fontsize=11)
             axes[0, 0].legend()
             axes[0, 0].grid(True, alpha=0.3)
@@ -1073,7 +980,7 @@ elif tab_selection == "📈 Results & Insights":
             axes[0, 1].axvline(historical_spend.mean(), color='red', linestyle='--', label='Current avg spend')
             axes[0, 1].axhline(y=1, color='green', linestyle='--', label='Break-even')
             axes[0, 1].set_title('Marginal ROAS', fontsize=14, fontweight='bold')
-            axes[0, 1].set_xlabel('Weekly Spend', fontsize=11)
+            axes[0, 1].set_xlabel('Daily Spend', fontsize=11)
             axes[0, 1].set_ylabel('Marginal ROAS', fontsize=11)
             axes[0, 1].legend()
             axes[0, 1].grid(True, alpha=0.3)
@@ -1083,7 +990,7 @@ elif tab_selection == "📈 Results & Insights":
             axes[1, 0].axvline(historical_spend.mean(), color='red', linestyle='--', label='Current avg spend')
             axes[1, 0].axhline(y=1, color='green', linestyle='--', label='Break-even')
             axes[1, 0].set_title('Incremental ROAS', fontsize=14, fontweight='bold')
-            axes[1, 0].set_xlabel('Weekly Spend', fontsize=11)
+            axes[1, 0].set_xlabel('Daily Spend', fontsize=11)
             axes[1, 0].set_ylabel('iROAS', fontsize=11)
             axes[1, 0].legend()
             axes[1, 0].grid(True, alpha=0.3)
@@ -1094,7 +1001,7 @@ elif tab_selection == "📈 Results & Insights":
             axes[1, 1].plot(spend_range, efficiency, color='green', linewidth=2)
             axes[1, 1].axvline(historical_spend.mean(), color='red', linestyle='--', label='Current avg spend')
             axes[1, 1].set_title('Spend Efficiency', fontsize=14, fontweight='bold')
-            axes[1, 1].set_xlabel('Weekly Spend', fontsize=11)
+            axes[1, 1].set_xlabel('Daily Spend', fontsize=11)
             axes[1, 1].set_ylabel('Revenue / Spend', fontsize=11)
             axes[1, 1].legend()
             axes[1, 1].grid(True, alpha=0.3)
@@ -1124,13 +1031,15 @@ elif tab_selection == "📈 Results & Insights":
                 saturation_level = (saturated[current_idx] / saturated[-1]) * 100
                 st.metric("Saturation Level", f"{saturation_level:.1f}%")
         
-        # Tab 4: Budget Allocation
+        # Tab 4: Budget Optimization (Scipy)
         with result_tabs[3]:
-            st.markdown("### Budget Allocation Optimizer")
+            st.markdown("### Budget Allocation Optimizer (Scipy SLSQP)")
             
             st.info("""
-            This tool helps you optimize budget allocation across channels based on their marginal ROI.
-            Channels with higher marginal ROI should receive more budget to maximize total revenue.
+            **Optimization Method:** Using scipy.optimize.minimize with SLSQP solver
+            - Maximizes total revenue subject to budget constraint
+            - Accounts for adstock carryover and saturation effects
+            - Finds optimal spend allocation across all channels
             """)
             
             # Current budget
@@ -1152,331 +1061,168 @@ elif tab_selection == "📈 Results & Insights":
                 budget_change = ((new_budget - current_budget) / current_budget) * 100
                 st.metric("Budget Change", f"{budget_change:+.1f}%")
             
-            # Simple allocation based on marginal ROI
-            st.markdown("---")
-            st.markdown("#### Recommended Allocation")
-            
-            # Calculate marginal ROI for each channel
-            allocation_data = []
-            
-            for feat in feat_cols:
-                channel_name = meta[feat]['spend_col']
-                beta = float(model.params.get(feat, 0.0))
-                kappa = meta[feat]['kappa']
-                slope = meta[feat]['slope']
-                sd = meta[feat]['sd']
-                ch_adstock = meta[feat]['adstock']  # Channel-specific adstock
-                
-                current_spend = test_df[channel_name].mean()
-                A = current_spend / (1 - ch_adstock)
-                marginal_roas = (beta / sd) * hill_derivative(A, kappa, slope) / (1 - ch_adstock)
-                
-                allocation_data.append({
-                    'Channel': channel_name.replace('_Cost', '').replace('_cost', ''),
-                    'Current Weekly Spend': current_spend,
-                    'Marginal ROI': marginal_roas,
-                    'Current Total Spend': test_df[channel_name].sum()
-                })
-            
-            alloc_df = pd.DataFrame(allocation_data)
-            
-            # Allocate proportionally to marginal ROI
-            total_marginal_roi = alloc_df['Marginal ROI'].sum()
-            alloc_df['Recommended %'] = (alloc_df['Marginal ROI'] / total_marginal_roi) * 100
-            alloc_df['Recommended Budget'] = (alloc_df['Recommended %'] / 100) * new_budget
-            alloc_df['Change vs Current'] = alloc_df['Recommended Budget'] - alloc_df['Current Total Spend']
-            alloc_df['Change %'] = (alloc_df['Change vs Current'] / alloc_df['Current Total Spend']) * 100
-            
-            # Display
-            st.dataframe(
-                alloc_df.style.format({
-                    'Current Weekly Spend': '{:,.0f}',
-                    'Marginal ROI': '{:.2f}',
-                    'Current Total Spend': '{:,.0f}',
-                    'Recommended %': '{:.1f}%',
-                    'Recommended Budget': '{:,.0f}',
-                    'Change vs Current': '{:+,.0f}',
-                    'Change %': '{:+.1f}%'
-                }).background_gradient(subset=['Marginal ROI'], cmap='RdYlGn'),
-                use_container_width=True
-            )
-            
-            # Visualization
-            st.markdown("---")
-            
-            fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 6))
-            
-            # Current vs Recommended
-            x = np.arange(len(alloc_df))
-            width = 0.35
-            
-            ax1.bar(x - width/2, alloc_df['Current Total Spend'], width, label='Current', color='steelblue')
-            ax1.bar(x + width/2, alloc_df['Recommended Budget'], width, label='Recommended', color='coral')
-            ax1.set_xlabel('Channel')
-            ax1.set_ylabel('Budget')
-            ax1.set_title('Current vs Recommended Budget Allocation', fontsize=14, fontweight='bold')
-            ax1.set_xticks(x)
-            ax1.set_xticklabels(alloc_df['Channel'], rotation=45, ha='right')
-            ax1.legend()
-            ax1.grid(axis='y', alpha=0.3)
-            
-            # Budget change
-            colors = ['green' if x > 0 else 'red' for x in alloc_df['Change %']]
-            ax2.barh(alloc_df['Channel'], alloc_df['Change %'], color=colors)
-            ax2.set_xlabel('Change (%)')
-            ax2.set_title('Recommended Budget Change by Channel', fontsize=14, fontweight='bold')
-            ax2.axvline(x=0, color='black', linestyle='-', linewidth=0.8)
-            ax2.grid(axis='x', alpha=0.3)
-            
-            plt.tight_layout()
-            st.pyplot(fig)
-            
-            # Expected impact
-            st.markdown("---")
-            st.markdown("### 📊 Expected Impact")
-            
-            # Calculate expected revenue under new allocation
-            # This is a simplified calculation
-            expected_lift = sum([
-                row['Marginal ROI'] * (row['Recommended Budget'] - row['Current Total Spend'])
-                for _, row in alloc_df.iterrows()
-            ])
-            
-            current_revenue = y_test.sum()
-            expected_revenue = current_revenue + expected_lift
-            
-            col1, col2, col3 = st.columns(3)
-            
-            with col1:
-                st.metric("Current Revenue", f"${current_revenue:,.0f}")
-            
-            with col2:
-                st.metric("Expected Revenue", f"${expected_revenue:,.0f}", delta=f"${expected_lift:,.0f}")
-            
-            with col3:
-                lift_pct = (expected_lift / current_revenue) * 100
-                st.metric("Expected Lift", f"{lift_pct:+.1f}%")
-        
-        # Tab 5: Monthly Forecast
-        with result_tabs[4]:
-            st.markdown("### 🔮 Monthly Revenue Forecast")
-            
-            st.info("""
-            This forecast projects monthly revenue based on:
-            - Current media spend levels (average from test period)
-            - Seasonal patterns (day of week + month effects from the model)
-            - Baseline revenue
-            """)
-            
-            # User inputs for forecast
-            forecast_col1, forecast_col2 = st.columns(2)
-            
-            with forecast_col1:
-                forecast_months = st.slider(
-                    "Forecast Horizon (Months)",
-                    min_value=1,
-                    max_value=12,
-                    value=3,
-                    help="Number of months to forecast ahead"
-                )
-            
-            with forecast_col2:
-                spend_scenario = st.selectbox(
-                    "Spend Scenario",
-                    ["Current Levels", "Increase 10%", "Increase 20%", "Decrease 10%", "Decrease 20%", "Custom"],
-                    help="Choose how to adjust spend for forecast"
-                )
-            
-            # Custom spend adjustments if selected
-            if spend_scenario == "Custom":
-                st.markdown("**Custom Spend Adjustments per Channel:**")
-                custom_adjustments = {}
-                for col in media_cols:
-                    channel_name = col.replace('_Cost', '').replace('_cost', '').replace('_Spend', '').replace('_spend', '')
-                    adj = st.slider(
-                        f"{channel_name} Adjustment",
-                        -50, 100, 0, 5,
-                        key=f'forecast_adj_{col}',
-                        help=f"% change in {channel_name} spend"
-                    )
-                    custom_adjustments[col] = 1 + (adj / 100)
-            
-            if st.button("🚀 Generate Forecast", type="primary"):
-                with st.spinner("Generating monthly forecast..."):
+            # Run optimization button
+            if st.button("🚀 Run Optimization", type="primary", use_container_width=True):
+                with st.spinner("Running scipy optimization..."):
                     try:
-                        # Get last date from test data
-                        last_date = pd.to_datetime(test_df[date_col]).max()
-                        
-                        # Generate future dates (daily, then aggregate to monthly)
-                        forecast_days = forecast_months * 30
-                        future_dates = pd.date_range(start=last_date + pd.Timedelta(days=1), periods=forecast_days, freq='D')
-                        
-                        forecast_data = pd.DataFrame({'date': future_dates})
-                        forecast_data['date'] = pd.to_datetime(forecast_data['date'])
-                        
-                        # Add seasonality features
-                        forecast_data['day_of_week'] = forecast_data['date'].dt.dayofweek
-                        forecast_data['month'] = forecast_data['date'].dt.month
-                        
-                        # Create day of week and month dummies
-                        day_dummies = pd.get_dummies(forecast_data['day_of_week'], prefix='dow', drop_first=True)
-                        month_dummies = pd.get_dummies(forecast_data['month'], prefix='month', drop_first=True)
-                        forecast_data = pd.concat([forecast_data, day_dummies, month_dummies], axis=1)
-                        
-                        # Add media spend (based on scenario)
-                        spend_multiplier = {
-                            "Current Levels": 1.0,
-                            "Increase 10%": 1.1,
-                            "Increase 20%": 1.2,
-                            "Decrease 10%": 0.9,
-                            "Decrease 20%": 0.8
-                        }
-                        
-                        for media_col in media_cols:
-                            avg_spend = test_df[media_col].mean()
+                        # Objective function
+                        def mmm_objective(channel_totals):
+                            """Calculate negative total revenue (we minimize)"""
+                            total_revenue = 0
                             
-                            if spend_scenario == "Custom":
-                                forecast_data[media_col] = avg_spend * custom_adjustments[media_col]
-                            else:
-                                forecast_data[media_col] = avg_spend * spend_multiplier[spend_scenario]
+                            for i, feat in enumerate(feat_cols):
+                                channel_name = meta[feat]['spend_col']
+                                beta = float(model.params.get(feat, 0.0))
+                                kappa = meta[feat]['kappa']
+                                slope = meta[feat]['slope']
+                                sd = meta[feat]['sd']
+                                mu = meta[feat]['mu']
+                                
+                                # Get optimized channel spend
+                                optimized_spend = channel_totals[i]
+                                
+                                # Calculate average daily spend for test period
+                                n_days = len(test_df)
+                                avg_daily_spend = optimized_spend / n_days
+                                
+                                # Apply adstock and saturation
+                                adstocked = avg_daily_spend / (1 - adstock_alpha)
+                                saturated = hill_transformation(adstocked, kappa, slope)
+                                standardized = (saturated - mu) / sd
+                                
+                                # Calculate contribution
+                                channel_revenue = beta * standardized * n_days
+                                total_revenue += channel_revenue
                             
-                            # Apply adstock and saturation transformations
-                            ch_adstock = channel_params[media_col]['adstock']
-                            ch_slope = channel_params[media_col]['hill_slope']
-                            
-                            feat = [f for f in feat_cols if meta[f]['spend_col'] == media_col][0]
-                            kappa = meta[feat]['kappa']
-                            mu = meta[feat]['mu']
-                            sd = meta[feat]['sd']
-                            
-                            # Adstock
-                            forecast_data[f'{media_col}_adstock'] = adstock_transformation(
-                                forecast_data[media_col].values, alpha=ch_adstock
-                            )
-                            
-                            # Saturation
-                            forecast_data[f'{media_col}_saturated'] = hill_transformation(
-                                forecast_data[f'{media_col}_adstock'].values,
-                                kappa=kappa,
-                                slope=ch_slope
-                            )
-                            
-                            # Standardize
-                            forecast_data[feat] = (forecast_data[f'{media_col}_saturated'] - mu) / sd
+                            # Return negative (we're minimizing)
+                            return -total_revenue
                         
-                        # Add control variables (use mean from test)
-                        if control_cols:
-                            for ctrl in control_cols:
-                                forecast_data[ctrl] = test_df[ctrl].mean()
+                        # Budget constraint
+                        def budget_constraint(channel_totals):
+                            return np.sum(channel_totals) - new_budget
                         
-                        # Prepare X for prediction
-                        seasonality_cols = [col for col in forecast_data.columns if 'dow_' in col or 'month_' in col]
+                        # Initial guess - current totals
+                        initial_totals = [test_df[meta[feat]['spend_col']].sum() for feat in feat_cols]
                         
-                        X_forecast = pd.concat([
-                            pd.Series(1.0, index=forecast_data.index, name='const'),
-                            forecast_data[feat_cols],
-                            forecast_data[control_cols] if control_cols else pd.DataFrame(index=forecast_data.index),
-                            forecast_data[seasonality_cols]
-                        ], axis=1)
+                        # Bounds - all >= 0
+                        bounds = [(0, None) for _ in feat_cols]
                         
-                        # Ensure same columns as training
-                        X_forecast = X_forecast.reindex(columns=X_train.columns, fill_value=0).astype('float64')
-                        
-                        # Predict
-                        forecast_data['predicted_revenue'] = model.predict(X_forecast)
-                        
-                        # Aggregate to monthly
-                        forecast_data['year_month'] = forecast_data['date'].dt.to_period('M')
-                        monthly_forecast = forecast_data.groupby('year_month').agg({
-                            'predicted_revenue': 'sum',
-                            **{col: 'sum' for col in media_cols}
-                        }).reset_index()
-                        
-                        monthly_forecast['year_month'] = monthly_forecast['year_month'].astype(str)
-                        monthly_forecast.columns = ['Month', 'Forecasted Revenue'] + [f"{col.replace('_Cost', '').replace('_cost', '')} Spend" for col in media_cols]
-                        
-                        # Calculate total spend and ROI
-                        spend_cols_renamed = [col for col in monthly_forecast.columns if 'Spend' in col]
-                        monthly_forecast['Total Spend'] = monthly_forecast[spend_cols_renamed].sum(axis=1)
-                        monthly_forecast['Forecast ROI'] = monthly_forecast['Forecasted Revenue'] / monthly_forecast['Total Spend']
-                        
-                        # Display results
-                        st.markdown("---")
-                        st.markdown("### 📊 Monthly Forecast Table")
-                        
-                        st.dataframe(
-                            monthly_forecast.style.format({
-                                'Forecasted Revenue': '{:,.0f}',
-                                'Total Spend': '{:,.0f}',
-                                'Forecast ROI': '{:.2f}',
-                                **{col: '{:,.0f}' for col in spend_cols_renamed}
-                            }).background_gradient(subset=['Forecasted Revenue', 'Forecast ROI'], cmap='Greens'),
-                            use_container_width=True,
-                            height=400
+                        # Solve
+                        solution = minimize(
+                            fun=mmm_objective,
+                            x0=initial_totals,
+                            bounds=bounds,
+                            method="SLSQP",
+                            constraints={
+                                'type': 'eq',
+                                'fun': budget_constraint
+                            },
+                            options={
+                                'maxiter': 1000,
+                                'ftol': 1e-9
+                            }
                         )
                         
-                        # Summary metrics
-                        st.markdown("---")
-                        st.markdown("### 📈 Forecast Summary")
+                        if solution.success:
+                            st.success("✅ Optimization completed successfully!")
+                            
+                            # Create results dataframe
+                            allocation_data = []
+                            for i, feat in enumerate(feat_cols):
+                                channel_name = meta[feat]['spend_col']
+                                current_spend = test_df[channel_name].sum()
+                                optimized_spend = solution.x[i]
+                                
+                                allocation_data.append({
+                                    'Channel': channel_name.replace('_Cost', '').replace('_cost', ''),
+                                    'Current Spend': current_spend,
+                                    'Optimized Spend': optimized_spend,
+                                    'Change': optimized_spend - current_spend,
+                                    'Change %': ((optimized_spend - current_spend) / current_spend * 100) if current_spend > 0 else 0
+                                })
+                            
+                            alloc_df = pd.DataFrame(allocation_data)
+                            
+                            # Display results
+                            st.markdown("---")
+                            st.markdown("#### 📊 Optimal Budget Allocation")
+                            
+                            st.dataframe(
+                                alloc_df.style.format({
+                                    'Current Spend': '{:,.0f}',
+                                    'Optimized Spend': '{:,.0f}',
+                                    'Change': '{:+,.0f}',
+                                    'Change %': '{:+.1f}%'
+                                }).background_gradient(subset=['Change %'], cmap='RdYlGn', vmin=-50, vmax=50),
+                                use_container_width=True
+                            )
+                            
+                            # Visualization
+                            st.markdown("---")
+                            fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 6))
+                            
+                            # Current vs Optimized
+                            x = np.arange(len(alloc_df))
+                            width = 0.35
+                            
+                            ax1.bar(x - width/2, alloc_df['Current Spend'], width, label='Current', color='steelblue')
+                            ax1.bar(x + width/2, alloc_df['Optimized Spend'], width, label='Optimized', color='coral')
+                            ax1.set_xlabel('Channel')
+                            ax1.set_ylabel('Budget')
+                            ax1.set_title('Current vs Optimized Budget (Scipy)', fontsize=14, fontweight='bold')
+                            ax1.set_xticks(x)
+                            ax1.set_xticklabels(alloc_df['Channel'], rotation=45, ha='right')
+                            ax1.legend()
+                            ax1.grid(axis='y', alpha=0.3)
+                            
+                            # Budget change
+                            colors = ['green' if x > 0 else 'red' for x in alloc_df['Change %']]
+                            ax2.barh(alloc_df['Channel'], alloc_df['Change %'], color=colors)
+                            ax2.set_xlabel('Change (%)')
+                            ax2.set_title('Budget Change by Channel', fontsize=14, fontweight='bold')
+                            ax2.axvline(x=0, color='black', linestyle='-', linewidth=0.8)
+                            ax2.grid(axis='x', alpha=0.3)
+                            
+                            plt.tight_layout()
+                            st.pyplot(fig)
+                            
+                            # Expected impact
+                            st.markdown("---")
+                            st.markdown("### 📈 Expected Impact")
+                            
+                            current_revenue = y_test.sum()
+                            optimized_revenue = -solution.fun  # Negative because we minimized
+                            expected_lift = optimized_revenue - current_revenue
+                            
+                            col1, col2, col3 = st.columns(3)
+                            
+                            with col1:
+                                st.metric("Current Revenue", f"${current_revenue:,.0f}")
+                            
+                            with col2:
+                                st.metric("Optimized Revenue", f"${optimized_revenue:,.0f}", delta=f"${expected_lift:,.0f}")
+                            
+                            with col3:
+                                lift_pct = (expected_lift / current_revenue) * 100
+                                st.metric("Expected Lift", f"{lift_pct:+.1f}%")
+                            
+                            # Optimization details
+                            with st.expander("🔧 Optimization Details"):
+                                st.write(f"**Method:** {solution.message}")
+                                st.write(f"**Iterations:** {solution.nit}")
+                                st.write(f"**Function Evaluations:** {solution.nfev}")
+                                st.write(f"**Objective Value:** {-solution.fun:,.2f}")
                         
-                        summary_col1, summary_col2, summary_col3, summary_col4 = st.columns(4)
-                        
-                        with summary_col1:
-                            total_forecast_revenue = monthly_forecast['Forecasted Revenue'].sum()
-                            st.metric("Total Forecasted Revenue", f"${total_forecast_revenue:,.0f}")
-                        
-                        with summary_col2:
-                            total_forecast_spend = monthly_forecast['Total Spend'].sum()
-                            st.metric("Total Planned Spend", f"${total_forecast_spend:,.0f}")
-                        
-                        with summary_col3:
-                            avg_monthly_revenue = monthly_forecast['Forecasted Revenue'].mean()
-                            st.metric("Avg Monthly Revenue", f"${avg_monthly_revenue:,.0f}")
-                        
-                        with summary_col4:
-                            overall_roi = total_forecast_revenue / total_forecast_spend if total_forecast_spend > 0 else 0
-                            st.metric("Overall Forecast ROI", f"{overall_roi:.2f}")
-                        
-                        # Visualization
-                        st.markdown("---")
-                        st.markdown("### 📉 Forecast Visualization")
-                        
-                        fig, ax = plt.subplots(figsize=(12, 6))
-                        
-                        x_pos = range(len(monthly_forecast))
-                        ax.bar(x_pos, monthly_forecast['Forecasted Revenue'], color='steelblue', alpha=0.7, label='Forecasted Revenue')
-                        ax.set_xlabel('Month', fontsize=12)
-                        ax.set_ylabel('Revenue', fontsize=12)
-                        ax.set_title(f'Monthly Revenue Forecast - {spend_scenario} Scenario', fontsize=14, fontweight='bold')
-                        ax.set_xticks(x_pos)
-                        ax.set_xticklabels(monthly_forecast['Month'], rotation=45, ha='right')
-                        ax.legend()
-                        ax.grid(axis='y', alpha=0.3)
-                        
-                        # Add value labels on bars
-                        for i, v in enumerate(monthly_forecast['Forecasted Revenue']):
-                            ax.text(i, v, f'${v/1000:.0f}K', ha='center', va='bottom', fontsize=9)
-                        
-                        plt.tight_layout()
-                        st.pyplot(fig)
-                        
-                        # Download button
-                        st.markdown("---")
-                        csv = monthly_forecast.to_csv(index=False)
-                        st.download_button(
-                            label="📥 Download Forecast CSV",
-                            data=csv,
-                            file_name=f"mmm_forecast_{datetime.now().strftime('%Y%m%d')}.csv",
-                            mime="text/csv"
-                        )
-                        
+                        else:
+                            st.error(f"❌ Optimization failed: {solution.message}")
+                    
                     except Exception as e:
-                        st.error(f"Error generating forecast: {str(e)}")
+                        st.error(f"❌ Error during optimization: {str(e)}")
                         import traceback
                         st.code(traceback.format_exc())
         
-        # Tab 6: Model Summary
-        with result_tabs[5]:
+        # Tab 5: Model Summary
+        with result_tabs[4]:
             st.markdown("### Model Summary")
             
             # Model coefficients
@@ -1489,7 +1235,8 @@ elif tab_selection == "📈 Results & Insights":
                     'Coefficient': model.params[param],
                     'Std Error': model.bse[param],
                     'T-Statistic': model.tvalues[param],
-                    'P-Value': model.pvalues[param]
+                    'P-Value': model.pvalues[param],
+                    'Significant': '***' if model.pvalues[param] < 0.001 else ('**' if model.pvalues[param] < 0.01 else ('*' if model.pvalues[param] < 0.05 else ''))
                 })
             
             coef_df = pd.DataFrame(coef_data)
@@ -1503,6 +1250,8 @@ elif tab_selection == "📈 Results & Insights":
                 }).background_gradient(subset=['Coefficient'], cmap='coolwarm', vmin=-1, vmax=1),
                 use_container_width=True
             )
+            
+            st.caption("Significance: *** p<0.001, ** p<0.01, * p<0.05")
             
             # Model statistics
             st.markdown("---")
@@ -1561,49 +1310,12 @@ elif tab_selection == "📈 Results & Insights":
             
             plt.tight_layout()
             st.pyplot(fig)
-            
-            # Download model summary
-            st.markdown("---")
-            st.markdown("#### 📥 Export Results")
-            
-            # Prepare summary report
-            summary_text = f"""
-MARKETING MIX MODEL SUMMARY REPORT
-Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
-
-=== MODEL PERFORMANCE ===
-R-squared: {model.rsquared:.4f}
-Adjusted R-squared: {model.rsquared_adj:.4f}
-MAPE (Test): {calculate_metrics(y_test, y_test_pred)[1]:.2%}
-wMAPE (Test): {calculate_metrics(y_test, y_test_pred)[2]:.2%}
-
-=== MODEL PARAMETERS (Channel-Specific) ===
-Training Samples: {len(st.session_state.y_train)}
-Test Samples: {len(y_test)}
-
-Channel Parameters:
-{chr(10).join([f"  {meta[f]['spend_col']}: Adstock={meta[f]['adstock']:.2f}, Slope={meta[f]['slope']:.2f}, Kappa={meta[f]['kappa']:.2f}" for f in feat_cols])}
-
-=== CHANNEL CONTRIBUTIONS ===
-{contrib_df.to_string()}
-
-=== ROI ANALYSIS ===
-{roi_df.to_string()}
-
-"""
-            
-            st.download_button(
-                label="📄 Download Summary Report",
-                data=summary_text,
-                file_name=f"mmm_summary_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt",
-                mime="text/plain"
-            )
 
 # Footer
 st.markdown("---")
 st.markdown("""
 <div style='text-align: center; color: #666; padding: 20px;'>
     <p>Marketing Mix Modeling Platform | Built with Streamlit</p>
-    <p>For questions or support, contact your analytics team</p>
+    <p>Featuring scipy.optimize budget optimization & promotion variable support</p>
 </div>
 """, unsafe_allow_html=True)
