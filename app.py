@@ -138,7 +138,10 @@ def calculate_metrics(y_true, y_pred):
 def add_seasonality_features(df, date_col):
     """Add seasonality features: day of week and month"""
     df = df.copy()
-    df[date_col] = pd.to_datetime(df[date_col])
+    
+    # Ensure datetime type
+    if not pd.api.types.is_datetime64_any_dtype(df[date_col]):
+        df[date_col] = pd.to_datetime(df[date_col], errors='coerce', dayfirst=True)
     
     # Day of week (0=Monday, 6=Sunday)
     df['day_of_week'] = df[date_col].dt.dayofweek
@@ -327,7 +330,7 @@ if tab_selection == "📤 Data Upload":
                     combined = st.session_state.kpi_data.copy()
                     date_col = combined.columns[0]
                     
-                    # Parse dates with multiple formats
+                    # Parse dates with multiple formats and ensure datetime64[ns] type
                     combined[date_col] = pd.to_datetime(combined[date_col], errors='coerce', dayfirst=True)
                     
                     # Merge each media channel
@@ -394,10 +397,10 @@ elif tab_selection == "🔍 Data Overview":
     if not st.session_state.data_uploaded:
         st.warning("⚠️ Please upload and combine data first in the 'Data Upload' tab!")
     else:
-        df = st.session_state.combined_data
+        df = st.session_state.combined_data.copy()
         date_col = df.columns[0]
         
-        # Ensure date column is datetime
+        # Ensure date column is datetime64[ns]
         if not pd.api.types.is_datetime64_any_dtype(df[date_col]):
             df[date_col] = pd.to_datetime(df[date_col], errors='coerce', dayfirst=True)
             # Update session state with corrected dates
@@ -529,7 +532,7 @@ elif tab_selection == "🎯 Marketing Mix Modeling":
         df = st.session_state.combined_data.copy()
         date_col = df.columns[0]
         
-        # Ensure date column is datetime
+        # Ensure date column is datetime64[ns]
         if not pd.api.types.is_datetime64_any_dtype(df[date_col]):
             df[date_col] = pd.to_datetime(df[date_col], errors='coerce', dayfirst=True)
         
@@ -895,13 +898,21 @@ elif tab_selection == "📈 Results & Insights":
                 )
             
             with col2:
-                # Pie chart
-                fig, ax = plt.subplots(figsize=(8, 6))
-                colors = plt.cm.Set3(range(len(contrib_df)))
-                ax.pie(contrib_df['Contribution'], labels=contrib_df.index, autopct='%1.1f%%',
-                       colors=colors, startangle=90)
-                ax.set_title('Revenue Contribution by Channel', fontsize=14, fontweight='bold')
-                st.pyplot(fig)
+                # Pie chart - only show positive contributions
+                positive_contrib = contrib_df[contrib_df['Contribution'] > 0].copy()
+                
+                if len(positive_contrib) > 0:
+                    fig, ax = plt.subplots(figsize=(8, 6))
+                    colors = plt.cm.Set3(range(len(positive_contrib)))
+                    ax.pie(positive_contrib['Contribution'], labels=positive_contrib.index, autopct='%1.1f%%',
+                           colors=colors, startangle=90)
+                    ax.set_title('Revenue Contribution by Channel (Positive Only)', fontsize=14, fontweight='bold')
+                    st.pyplot(fig)
+                    
+                    if len(contrib_df) > len(positive_contrib):
+                        st.caption(f"⚠️ {len(contrib_df) - len(positive_contrib)} channel(s) with negative contribution excluded from pie chart")
+                else:
+                    st.warning("No positive contributions to display in pie chart")
             
             # Bar chart
             st.markdown("---")
@@ -934,6 +945,10 @@ elif tab_selection == "📈 Results & Insights":
                 # Total spend
                 total_spend = test_df[channel_name].sum()
                 
+                # Skip if no spend
+                if total_spend <= 0:
+                    continue
+                
                 # ROI (iROAS)
                 roi = contrib / total_spend if total_spend > 0 else 0
                 
@@ -943,9 +958,13 @@ elif tab_selection == "📈 Results & Insights":
                 sd = meta[feat]['sd']
                 
                 current_avg_spend = test_df[channel_name].mean()
-                A = current_avg_spend / (1 - adstock_alpha)
                 
-                marginal_roas = (beta / sd) * hill_derivative(A, kappa, slope) / (1 - adstock_alpha)
+                # Skip if current average spend is 0 or negative
+                if current_avg_spend <= 0:
+                    marginal_roas = 0
+                else:
+                    A = current_avg_spend / (1 - adstock_alpha) if adstock_alpha < 1 else current_avg_spend
+                    marginal_roas = (beta / sd) * hill_derivative(A, kappa, slope) / (1 - adstock_alpha) if adstock_alpha < 1 else 0
                 
                 roi_data.append({
                     'Channel': channel_name.replace('_Cost', '').replace('_cost', ''),
@@ -954,6 +973,10 @@ elif tab_selection == "📈 Results & Insights":
                     'ROI (iROAS)': roi,
                     'Marginal ROI': marginal_roas
                 })
+            
+            if not roi_data:
+                st.warning("⚠️ No channels with positive spend found for ROI analysis")
+                st.stop()
             
             roi_df = pd.DataFrame(roi_data).sort_values('ROI (iROAS)', ascending=False)
             
@@ -1041,17 +1064,32 @@ elif tab_selection == "📈 Results & Insights":
             
             # Generate spend range
             historical_spend = test_df[selected_channel].values
-            max_spend = np.percentile(historical_spend, 95)
+            
+            # Filter out zero/negative spends
+            valid_spend = historical_spend[historical_spend > 0]
+            
+            if len(valid_spend) == 0:
+                st.warning(f"⚠️ No positive spend data found for {selected_channel}")
+                st.stop()
+            
+            max_spend = np.percentile(valid_spend, 95)
             spend_range = np.linspace(0, max_spend * 1.5, 200)
             
             # Calculate responses
-            adstocked = spend_range / (1 - adstock_alpha)
+            if adstock_alpha < 1:
+                adstocked = spend_range / (1 - adstock_alpha)
+            else:
+                adstocked = spend_range
+                
             saturated = hill_transformation(adstocked, kappa, slope)
             standardized = (saturated - mu) / sd
             revenue = beta * standardized
             
             # Calculate marginal ROAS
-            marginal_roas = (beta / sd) * hill_derivative(adstocked, kappa, slope) / (1 - adstock_alpha)
+            if adstock_alpha < 1:
+                marginal_roas = (beta / sd) * hill_derivative(adstocked, kappa, slope) / (1 - adstock_alpha)
+            else:
+                marginal_roas = np.zeros_like(spend_range)
             
             # Calculate iROAS
             iroas = np.zeros_like(revenue)
@@ -1108,7 +1146,7 @@ elif tab_selection == "📈 Results & Insights":
             st.markdown("---")
             st.markdown("### 📊 Current Performance Metrics")
             
-            current_spend = historical_spend.mean()
+            current_spend = valid_spend.mean()
             current_idx = np.argmin(np.abs(spend_range - current_spend))
             
             metric_col1, metric_col2, metric_col3, metric_col4 = st.columns(4)
@@ -1123,7 +1161,10 @@ elif tab_selection == "📈 Results & Insights":
                 st.metric("iROAS", f"{iroas[current_idx]:.2f}")
             
             with metric_col4:
-                saturation_level = (saturated[current_idx] / saturated[-1]) * 100
+                if saturated[-1] > 0:
+                    saturation_level = (saturated[current_idx] / saturated[-1]) * 100
+                else:
+                    saturation_level = 0
                 st.metric("Saturation Level", f"{saturation_level:.1f}%")
         
         # Tab 4: Budget Optimization (Scipy)
@@ -1178,12 +1219,16 @@ elif tab_selection == "📈 Results & Insights":
                                 
                                 # Calculate average daily spend for test period
                                 n_days = len(test_df)
-                                avg_daily_spend = optimized_spend / n_days
+                                avg_daily_spend = optimized_spend / n_days if n_days > 0 else 0
                                 
                                 # Apply adstock and saturation
-                                adstocked = avg_daily_spend / (1 - adstock_alpha)
+                                if adstock_alpha < 1:
+                                    adstocked = avg_daily_spend / (1 - adstock_alpha)
+                                else:
+                                    adstocked = avg_daily_spend
+                                    
                                 saturated = hill_transformation(adstocked, kappa, slope)
-                                standardized = (saturated - mu) / sd
+                                standardized = (saturated - mu) / sd if sd > 0 else 0
                                 
                                 # Calculate contribution
                                 channel_revenue = beta * standardized * n_days
