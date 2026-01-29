@@ -1201,11 +1201,26 @@ elif tab_selection == "📈 Results & Insights":
             if st.button("🚀 Run Optimization", type="primary", use_container_width=True):
                 with st.spinner("Running scipy optimization..."):
                     try:
-                        # Objective function
+                        # Get baseline and seasonality contributions (these don't change with budget)
+                        baseline_contrib = float(model.params.get('const', 0.0)) * len(test_df)
+                        
+                        # Get seasonality contribution
+                        seasonality_cols = [col for col in X_test.columns if 'dow_' in col or 'month_' in col]
+                        seasonality_contrib = 0
+                        for col in seasonality_cols:
+                            if col in X_test.columns and col in model.params:
+                                seasonality_contrib += (X_test[col].values * float(model.params[col])).sum()
+                        
+                        # Objective function - FIXED to include all components
                         def mmm_objective(channel_totals):
-                            """Calculate negative total revenue (we minimize)"""
-                            total_revenue = 0
+                            """
+                            Calculate negative total revenue (we minimize)
+                            Includes: baseline + media + seasonality
+                            """
+                            # Start with baseline and seasonality (constant regardless of media spend)
+                            total_revenue = baseline_contrib + seasonality_contrib
                             
+                            # Add media contributions
                             for i, feat in enumerate(feat_cols):
                                 channel_name = meta[feat]['spend_col']
                                 beta = float(model.params.get(feat, 0.0))
@@ -1214,24 +1229,33 @@ elif tab_selection == "📈 Results & Insights":
                                 sd = meta[feat]['sd']
                                 mu = meta[feat]['mu']
                                 
-                                # Get optimized channel spend
-                                optimized_spend = channel_totals[i]
+                                # Get current and optimized total spend
+                                current_total = test_df[channel_name].sum()
+                                optimized_total = channel_totals[i]
                                 
-                                # Calculate average daily spend for test period
-                                n_days = len(test_df)
-                                avg_daily_spend = optimized_spend / n_days if n_days > 0 else 0
-                                
-                                # Apply adstock and saturation
-                                if adstock_alpha < 1:
-                                    adstocked = avg_daily_spend / (1 - adstock_alpha)
+                                # Calculate scaling factor
+                                if current_total > 0:
+                                    scale = optimized_total / current_total
                                 else:
-                                    adstocked = avg_daily_spend
-                                    
-                                saturated = hill_transformation(adstocked, kappa, slope)
-                                standardized = (saturated - mu) / sd if sd > 0 else 0
+                                    scale = 0
                                 
-                                # Calculate contribution
-                                channel_revenue = beta * standardized * n_days
+                                # Scale the historical daily pattern (preserves temporal dynamics)
+                                scaled_daily_spend = test_df[channel_name].values * scale
+                                
+                                # Apply adstock transformation to scaled pattern
+                                adstocked_spend = adstock_transformation(scaled_daily_spend, alpha=adstock_alpha)
+                                
+                                # Apply saturation
+                                saturated_spend = hill_transformation(adstocked_spend, kappa, slope)
+                                
+                                # Standardize
+                                if sd > 0:
+                                    standardized_spend = (saturated_spend - mu) / sd
+                                else:
+                                    standardized_spend = saturated_spend - mu
+                                
+                                # Calculate contribution (sum across all days)
+                                channel_revenue = np.sum(beta * standardized_spend)
                                 total_revenue += channel_revenue
                             
                             # Return negative (we're minimizing)
