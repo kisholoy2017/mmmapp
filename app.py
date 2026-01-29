@@ -1354,21 +1354,37 @@ elif tab_selection == "📈 Results & Insights":
                             st.markdown("---")
                             st.markdown("### 📈 Expected Impact")
                             
-                            current_revenue = y_test.sum()
-                            optimized_revenue = -solution.fun  # Negative because we minimized
-                            expected_lift = optimized_revenue - current_revenue
+                            # Calculate CURRENT revenue using MODEL prediction (not actual)
+                            # This ensures apples-to-apples comparison
+                            current_allocation = [test_df[meta[feat]['spend_col']].sum() for feat in feat_cols]
+                            current_revenue_model = -mmm_objective(current_allocation)
+                            
+                            # Optimized revenue is also model prediction
+                            optimized_revenue = -solution.fun
+                            expected_lift = optimized_revenue - current_revenue_model
                             
                             col1, col2, col3 = st.columns(3)
                             
                             with col1:
-                                st.metric("Current Revenue", f"${current_revenue:,.0f}")
+                                st.metric("Current Revenue (Model)", f"${current_revenue_model:,.0f}")
                             
                             with col2:
-                                st.metric("Optimized Revenue", f"${optimized_revenue:,.0f}", delta=f"${expected_lift:,.0f}")
+                                st.metric("Optimized Revenue (Model)", f"${optimized_revenue:,.0f}", delta=f"${expected_lift:,.0f}")
                             
                             with col3:
-                                lift_pct = (expected_lift / current_revenue) * 100
+                                lift_pct = (expected_lift / current_revenue_model) * 100 if current_revenue_model > 0 else 0
                                 st.metric("Expected Lift", f"{lift_pct:+.1f}%")
+                            
+                            # Show actual vs model comparison
+                            with st.expander("📊 Model vs Actual Comparison"):
+                                actual_revenue = y_test.sum()
+                                model_pred_current = current_revenue_model
+                                prediction_error = ((model_pred_current - actual_revenue) / actual_revenue * 100)
+                                
+                                st.write(f"**Actual Test Revenue:** ${actual_revenue:,.0f}")
+                                st.write(f"**Model Prediction (Current):** ${model_pred_current:,.0f}")
+                                st.write(f"**Prediction Error:** {prediction_error:+.1f}%")
+                                st.caption("Note: Optimization compares model predictions, not actual revenue")
                             
                             # Optimization details
                             with st.expander("🔧 Optimization Details"):
